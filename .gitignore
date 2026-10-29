@@ -39,3 +39,13 @@ crashdumps/
 .sisyphus/
 opencode.json
 oh-my-opencode.json
+
+# SDK (repositorio propio en thirdparty/rexglue-sdk, rama re-wor-parches)
+thirdparty/
+
+# Registros de compilacion
+build_log.txt
+build_publicar_log.txt
+
+# Notas de trabajo locales (no se publican)
+CLAUDE.md

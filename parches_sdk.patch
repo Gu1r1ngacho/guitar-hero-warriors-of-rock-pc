@@ -1,0 +1,3093 @@
+diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
+index cf67c34..6c6a72f 100644
+--- a/include/rex/audio/audio_system.h
++++ b/include/rex/audio/audio_system.h
+@@ -66,13 +66,12 @@ class AudioSystem : public system::IAudioSystem {
+                                 AudioDriver** out_driver) = 0;
+   virtual void DestroyDriver(AudioDriver* driver) = 0;
+ 
+-  // TODO(gibbed): respect XAUDIO2_MAX_QUEUED_BUFFERS somehow (ie min(64,
+-  // XAUDIO2_MAX_QUEUED_BUFFERS))
+-  // static const size_t kMaximumQueuedFrames = 64;
++  static constexpr size_t kMaximumQueuedFrames = 64;
+ 
+   memory::Memory* memory_ = nullptr;
+   runtime::Processor* processor_ = nullptr;
+   std::unique_ptr<XmaDecoder> xma_decoder_;
++  uint32_t queued_frames_;
+ 
+   std::atomic<bool> worker_running_ = {false};
+   system::object_ref<system::XHostThread> worker_thread_;
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 7558183..8694bff 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -14,11 +14,10 @@
+ #include <array>
+ #include <atomic>
+ #include <mutex>
+-#include <queue>
+-// #include <vector>
+ 
+ #include <rex/kernel.h>
+ #include <rex/memory.h>
++#include <rex/thread.h>
+ 
+ // XMA audio format:
+ // From research, XMA appears to be based on WMA Pro with
+@@ -68,7 +67,8 @@ struct XMA_CONTEXT_DATA {
+   uint32_t loop_subframe_skip : 3;            // +17bit, XMASetLoopData might be
+                                               // subframe_decode_count
+   uint32_t subframe_decode_count : 4;         // +20bit
+-  uint32_t subframe_skip_count : 3;           // +24bit
++  uint32_t output_buffer_padding : 3;         // +24bit, extra output buffer blocks
++                                              // reserved per decoded frame
+   uint32_t sample_rate : 2;                   // +27bit enum of sample rates
+   uint32_t is_stereo : 1;                     // +29bit
+   uint32_t unk_dword_1_c : 1;                 // +30bit
+@@ -76,12 +76,14 @@ struct XMA_CONTEXT_DATA {
+ 
+   // DWORD 2
+   uint32_t input_buffer_read_offset : 26;  // XMAGetInputBufferReadOffset
+-  uint32_t unk_dword_2 : 6;                // ErrorStatus/ErrorSet (?)
++  uint32_t error_status : 5;               // ErrorStatus
++  uint32_t error_set : 1;                  // ErrorSet
+ 
+   // DWORD 3
+-  uint32_t loop_start : 26;  // XMASetLoopData LoopStartOffset
+-                             // frame offset in bits
+-  uint32_t unk_dword_3 : 6;  // ? ParserErrorStatus/ParserErrorSet(?)
++  uint32_t loop_start : 26;          // XMASetLoopData LoopStartOffset
++                                     // frame offset in bits
++  uint32_t parser_error_status : 5;  // ParserErrorStatus
++  uint32_t parser_error_set : 1;     // ParserErrorSet
+ 
+   // DWORD 4
+   uint32_t loop_end : 26;        // XMASetLoopData LoopEndOffset
+@@ -117,6 +119,32 @@ struct XMA_CONTEXT_DATA {
+     memory::copy_and_swap(reinterpret_cast<uint32_t*>(ptr), reinterpret_cast<const uint32_t*>(this),
+                           sizeof(XMA_CONTEXT_DATA) / 4);
+   }
++
++  bool IsInputBufferValid(uint8_t buffer_index) const {
++    return buffer_index == 0 ? input_buffer_0_valid : input_buffer_1_valid;
++  }
++
++  bool IsCurrentInputBufferValid() const { return IsInputBufferValid(current_buffer); }
++
++  bool IsAnyInputBufferValid() const { return input_buffer_0_valid || input_buffer_1_valid; }
++
++  uint32_t GetInputBufferAddress(uint8_t buffer_index) const {
++    return buffer_index == 0 ? input_buffer_0_ptr : input_buffer_1_ptr;
++  }
++
++  uint32_t GetCurrentInputBufferAddress() const { return GetInputBufferAddress(current_buffer); }
++
++  uint32_t GetInputBufferPacketCount(uint8_t buffer_index) const {
++    return buffer_index == 0 ? input_buffer_0_packet_count : input_buffer_1_packet_count;
++  }
++
++  uint32_t GetCurrentInputBufferPacketCount() const {
++    return GetInputBufferPacketCount(current_buffer);
++  }
++
++  bool IsConsumeOnlyContext() const {
++    return (input_buffer_0_packet_count | input_buffer_1_packet_count) == 0;
++  }
+ };
+ static_assert_size(XMA_CONTEXT_DATA, 64);
+ 
+@@ -128,11 +156,26 @@ struct Xma2ExtraData {
+ static_assert_size(Xma2ExtraData, 34);
+ #pragma pack(pop)
+ 
++struct kPacketInfo {
++  uint8_t frame_count_ = 0;
++  uint8_t current_frame_ = 0;
++  uint32_t current_frame_size_ = 0;
++
++  bool isLastFrameInPacket() const {
++    return frame_count_ == 0 || current_frame_ == frame_count_ - 1;
++  }
++};
++
++static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
++
+ class XmaContext {
+  public:
+   static const uint32_t kBytesPerPacket = 2048;
+   static const uint32_t kBitsPerPacket = kBytesPerPacket * 8;
+-  static const uint32_t kBitsPerHeader = 33;
++  static const uint32_t kBitsPerPacketHeader = 32;
++  static const uint32_t kBitsPerFrameHeader = 15;
++  static const uint32_t kBytesPerPacketHeader = 4;
++  static const uint32_t kBytesPerPacketData = kBytesPerPacket - kBytesPerPacketHeader;
+ 
+   static const uint32_t kBytesPerSample = 2;
+   static const uint32_t kSamplesPerFrame = 512;
+@@ -140,8 +183,9 @@ class XmaContext {
+   static const uint32_t kBytesPerFrameChannel = kSamplesPerFrame * kBytesPerSample;
+   static const uint32_t kBytesPerSubframeChannel = kSamplesPerSubframe * kBytesPerSample;
+ 
+-  // static const uint32_t kOutputBytesPerBlock = 256;
+-  // static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
++  static const uint32_t kOutputBytesPerBlock = 256;
++  static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
++  static const uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
+ 
+   explicit XmaContext();
+   ~XmaContext();
+@@ -165,64 +209,79 @@ class XmaContext {
+   void set_is_allocated(bool is_allocated) { is_allocated_ = is_allocated; }
+   void set_is_enabled(bool is_enabled) { is_enabled_ = is_enabled; }
+ 
++  void SignalWorkDone() {
++    if (work_completion_event_) {
++      work_completion_event_->Set();
++    }
++  }
++  void WaitForWorkDone() {
++    if (work_completion_event_) {
++      rex::thread::Wait(work_completion_event_.get(), false);
++    }
++  }
++
+  private:
+   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
+-  static bool TrySetupNextLoop(XMA_CONTEXT_DATA* data, bool ignore_input_buffer_offset);
+-  static void NextPacket(XMA_CONTEXT_DATA* data);
+   static int GetSampleRate(int id);
+-  // Get the offset of the next frame. Does not traverse packets.
+-  static size_t GetNextFrame(uint8_t* block, size_t size, size_t bit_offset);
+-  // Get the containing packet number of the frame pointed to by the offset.
+-  static int GetFramePacketNumber(uint8_t* block, size_t size, size_t bit_offset);
+-  // Get the packet number and the index of the frame inside that packet
+-  static std::tuple<int, int> GetFrameNumber(uint8_t* block, size_t size, size_t bit_offset);
+-  // Get the number of frames contained in the packet (including truncated) and
+-  // if the last frame is split.
+-  static std::tuple<int, bool> GetPacketFrameCount(uint8_t* packet);
+-
+-  // Convert sample format and swap bytes
+-  static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
++  static int16_t GetPacketNumber(size_t size, size_t bit_offset);
++  static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
++
++  kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
++  uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
++  const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
++                               uint32_t current_input_packet_count);
++  static bool FindFrameStart(const uint8_t* buffer, uint32_t packet_index,
++                             uint32_t packet_count, uint32_t* out_offset,
++                             uint32_t* out_carry);
++  uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
++                                   uint32_t current_input_packet_count);
++  uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
+ 
+-  bool ValidFrameOffset(uint8_t* block, size_t size_bytes, size_t frame_offset_bits);
+   void Decode(XMA_CONTEXT_DATA* data);
+-  int PrepareDecoder(uint8_t* packet, int sample_rate, bool is_two_channel);
++  void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
++  void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
++  void ClearLocked(XMA_CONTEXT_DATA* data);
++
++  memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
++  int PrepareDecoder(int sample_rate, bool is_two_channel);
++  void PreparePacket(uint32_t frame_size, uint32_t frame_padding);
++  bool DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet, AVFrame* av_frame);
++
++  void StoreContextMerged(const XMA_CONTEXT_DATA& data, const XMA_CONTEXT_DATA& initial_data,
++                          uint8_t* context_ptr);
++
++  static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+ 
+   memory::Memory* memory_ = nullptr;
++  std::unique_ptr<rex::thread::Event> work_completion_event_;
+ 
+   uint32_t id_ = 0;
+   uint32_t guest_ptr_ = 0;
+   std::mutex lock_;
+-  bool is_allocated_ = false;
+-  bool is_enabled_ = false;
+-  // bool is_dirty_ = true;
++  std::atomic<bool> is_allocated_ = false;
++  std::atomic<bool> is_enabled_ = false;
+ 
+   // ffmpeg structures
+   AVPacket* av_packet_ = nullptr;
+   AVCodec* av_codec_ = nullptr;
+   AVCodecContext* av_context_ = nullptr;
+   AVFrame* av_frame_ = nullptr;
+-  // uint32_t decoded_consumed_samples_ = 0; // TODO do this dynamically
+-  // int decoded_idx_ = -1;
+-
+-  // bool partial_frame_saved_ = false;
+-  // bool partial_frame_size_known_ = false;
+-  // size_t partial_frame_total_size_bits_ = 0;
+-  // size_t partial_frame_start_offset_bits_ = 0;
+-  // size_t partial_frame_offset_bits_ = 0;  // blah internal don't use this
+-  // std::vector<uint8_t> partial_frame_buffer_;
+-  uint32_t packets_skip_ = 0;
+-
+-  // bool split_frame_pending_ = false;
+-  uint32_t split_frame_len_ = 0;
+-  uint32_t split_frame_len_partial_ = 0;
+-  uint8_t split_frame_padding_start_ = 0;
+-  // first byte contains bit offset information
+-  std::array<uint8_t, 1 + 4096> xma_frame_;
+ 
+-  // uint8_t* current_frame_ = nullptr;
+-  // conversion buffer for 2 channel frame
++  // Packet data buffer (two packets worth for split frame handling)
++  std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;
++  // First byte contains bit offset information
++  std::array<uint8_t, 1 + 4096> xma_frame_;
++  // Conversion buffer for up to 2-channel frame
+   std::array<uint8_t, kBytesPerFrameChannel * 2> raw_frame_;
+-  // std::vector<uint8_t> current_frame_ = std::vector<uint8_t>(0);
++
++  // Output buffer tracking
++  int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
++  uint8_t current_frame_remaining_subframes_ = 0;
++
++  // Loop subframe precision state
++  uint8_t loop_frame_output_limit_ = 0;
++  bool loop_start_skip_pending_ = false;
++  uint32_t pending_packet_skip_ = 0;  // Parche: salto de paquetes pendiente entre buferes
+ };
+ 
+ }  // namespace rex::audio
+diff --git a/include/rex/audio/xma/helpers.h b/include/rex/audio/xma/helpers.h
+index b2e0e10..638e406 100644
+--- a/include/rex/audio/xma/helpers.h
++++ b/include/rex/audio/xma/helpers.h
+@@ -17,30 +17,30 @@
+ 
+ namespace rex::audio::xma {
+ 
+-static const uint32_t kMaxFrameLength = 0x7FFF;
++static constexpr uint32_t kMaxFrameLength = 0x7FFF;
+ 
+-// Get number of frames that /begin/ in this packet.
+-inline uint32_t GetPacketFrameCount(uint8_t* packet) {
+-  return (uint8_t)(packet[0] >> 2);
++// Get number of frames that /begin/ in this packet. Valid only for XMA2 packets.
++inline uint8_t GetPacketFrameCount(const uint8_t* packet) {
++  return packet[0] >> 2;
+ }
+ 
+ // Get the first frame offset in bits
+-inline uint32_t GetPacketFrameOffset(uint8_t* packet) {
+-  uint32_t val = (uint16_t)(((packet[0] & 0x3) << 13) | (packet[1] << 5) | (packet[2] >> 3));
+-  // if (val > kBitsPerPacket - kBitsPerHeader) {
+-  //   // There is no data in this packet
+-  //   return -1;
+-  // } else {
++inline uint32_t GetPacketFrameOffset(const uint8_t* packet) {
++  uint32_t val =
++      static_cast<uint16_t>(((packet[0] & 0x3) << 13) | (packet[1] << 5) | (packet[2] >> 3));
+   return val + 32;
+-  // }
+ }
+ 
+-inline uint32_t GetPacketMetadata(uint8_t* packet) {
+-  return (uint8_t)(packet[2] & 0x7);
++inline uint8_t GetPacketMetadata(const uint8_t* packet) {
++  return packet[2] & 0x7;
+ }
+ 
+-inline uint32_t GetPacketSkipCount(uint8_t* packet) {
+-  return (uint8_t)(packet[3]);
++inline bool IsPacketXma2Type(const uint8_t* packet) {
++  return GetPacketMetadata(packet) == 1;
++}
++
++inline uint8_t GetPacketSkipCount(const uint8_t* packet) {
++  return packet[3];
+ }
+ 
+ }  // namespace rex::audio::xma
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index abbd046..e29a22b 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -80,6 +80,11 @@ class TextureCache {
+   virtual void BeginFrame();
+ 
+   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
++  // Parche: con escala de resolucion, una escritura de la GPU por memexport en una zona
++  // que antes se dibujo con escala debe quitar la marca de "escalada" (el SDK solo lo
++  // hacia para escrituras del procesador), para que las texturas lean lo recien escrito.
++  // Devuelve true si habia paginas marcadas.
++  bool UnmarkScaledResolveRangeWrittenByGpu(uint32_t start_unscaled, uint32_t length_unscaled);
+   // Ensures the memory backing the range in the scaled resolve address space is
+   // allocated and returns whether it is.
+   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
+diff --git a/include/rex/ppc/memory.h b/include/rex/ppc/memory.h
+index b8b5f66..067ce5e 100644
+--- a/include/rex/ppc/memory.h
++++ b/include/rex/ppc/memory.h
+@@ -317,13 +317,15 @@ struct FrsqrteLUT {
+   constexpr FrsqrteLUT() {
+     for (uint32_t i = 0; i < 0x8000; i++) {
+       const uint32_t sign = (i >> 14) & 1;
+-      const uint32_t expv = i & 0x3FFF;
++      // Parche: el indice es [signo:1][exponente:11][mantisa:3]; el exponente son
++      // los bits 3-13 (antes se usaba i & 0x3FFF y la estimacion salia ~1e141).
++      const uint32_t expv = (i >> 3) & 0x7FF;
+ 
+       if (sign) {
+         data[i] = 0x7FF80000u;
+       } else if (expv == 0) {
+         data[i] = 0x7FF00000u;
+-      } else if (expv >= 0x3FE0) {
++      } else if (expv == 0x7FF) {
+         data[i] = 0;
+       } else {
+         const uint32_t exp = 0x3FE00000u - (((expv + 0x1C01) >> 1) << 20);
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a5042a..9f2a6f5 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -24,7 +24,9 @@
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
+ 
+-REXCVAR_DEFINE_INT32(audio_maxqframes, 64, "Audio", "Adjust audio maximum queued frames");
++REXCVAR_DEFINE_INT32(
++    audio_maxqframes, 8, "Audio",
++    "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -44,8 +46,12 @@ AudioSystem::AudioSystem(runtime::Processor* processor)
+     : memory_(processor->memory()), processor_(processor), worker_running_(false) {
+   std::memset(clients_, 0, sizeof(clients_));
+ 
++  queued_frames_ = std::min(
++      static_cast<uint32_t>(kMaximumQueuedFrames),
++      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
++
+   for (size_t i = 0; i < kMaximumClientCount; ++i) {
+-    client_semaphores_[i] = rex::thread::Semaphore::Create(0, REXCVAR_GET(audio_maxqframes));
++    client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
+     assert_not_null(client_semaphores_[i]);
+     wait_handles_[i] = client_semaphores_[i].get();
+   }
+@@ -89,6 +95,7 @@ void AudioSystem::WorkerThreadMain() {
+   Initialize();
+ 
+   // Main run loop.
++  uint32_t diag_pump_count = 0;
+   while (worker_running_) {
+     // These handles signify the number of submitted samples. Once we reach
+     // 64 samples, we wait until our audio backend releases a semaphore
+@@ -96,10 +103,16 @@ void AudioSystem::WorkerThreadMain() {
+     auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
+                                        std::chrono::milliseconds(500));
+     if (result.first == rex::thread::WaitResult::kFailed) {
+-      // TODO: Assert?
++      REXAPU_WARN("AudioWorker: WaitAny failed");
+       continue;
+     }
+ 
++    if (result.first == rex::thread::WaitResult::kTimeout) {
++      if (diag_pump_count < 5) {
++        REXAPU_DEBUG("AudioWorker: WaitAny timed out (no semaphore signals)");
++      }
++    }
++
+     if (result.first == thread::WaitResult::kSuccess && result.second == kMaximumClientCount) {
+       // Shutdown event signaled.
+       if (paused_) {
+@@ -121,10 +134,20 @@ void AudioSystem::WorkerThreadMain() {
+       global_lock.unlock();
+ 
+       if (client_callback) {
++        if (diag_pump_count < 10) {
++          REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
++                       client_callback, client_callback_arg, index);
++        }
+         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
+         uint64_t args[] = {client_callback_arg};
+         processor_->Execute(worker_thread_->thread_state(), client_callback, args,
+                             rex::countof(args));
++        if (diag_pump_count < 10) {
++          REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
++        }
++        diag_pump_count++;
++      } else {
++        REXAPU_DEBUG("AudioWorker: semaphore signaled for client {} but callback is 0", index);
+       }
+ 
+       pumped = true;
+@@ -170,7 +193,10 @@ void AudioSystem::Shutdown() {
+   worker_running_ = false;
+   shutdown_event_->Set();
+   if (worker_thread_) {
+-    worker_thread_->Wait(0, 0, 0, nullptr);
++    // The worker may be stuck inside a guest callback that is itself blocked
++    // on guest objects (e.g. KeWaitForMultipleObjects).
++    // Terminate the thread to break the deadlock.
++    worker_thread_->Terminate(0);
+     worker_thread_.reset();
+   }
+ 
+@@ -188,13 +214,17 @@ void AudioSystem::Shutdown() {
+ }
+ 
+ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index) {
++  REXAPU_DEBUG("AudioSystem::RegisterClient: callback={:08X} callback_arg={:08X}", callback,
++               callback_arg);
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   auto index = FindFreeClient();
+   assert_true(index >= 0);
++  REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
++               queued_frames_);
+ 
+   auto client_semaphore = client_semaphores_[index].get();
+-  auto ret = client_semaphore->Release(REXCVAR_GET(audio_maxqframes), nullptr);
++  auto ret = client_semaphore->Release(queued_frames_, nullptr);
+   assert_true(ret);
+ 
+   AudioDriver* driver;
+@@ -219,6 +249,13 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+   SCOPE_profile_cpu_f("apu");
+ 
++  static uint32_t submit_count = 0;
++  if (submit_count < 10) {
++    REXAPU_DEBUG("AudioSystem::SubmitFrame called: index={} samples_ptr={:08X}", index,
++                 samples_ptr);
++    submit_count++;
++  }
++
+   auto global_lock = global_critical_region_.Acquire();
+   assert_true(index < kMaximumClientCount);
+   assert_true(clients_[index].driver != NULL);
+@@ -296,7 +333,7 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
+     client.in_use = true;
+ 
+     auto client_semaphore = client_semaphores_[id].get();
+-    auto ret = client_semaphore->Release(REXCVAR_GET(audio_maxqframes), nullptr);
++    auto ret = client_semaphore->Release(queued_frames_, nullptr);
+     assert_true(ret);
+ 
+     AudioDriver* driver = nullptr;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 554c03b..bd56f36 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -110,6 +110,13 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
+ 
++  static uint32_t sdl_submit_count = 0;
++  if (sdl_submit_count < 10) {
++    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
++                 frames_queued_.size() + 1);
++    sdl_submit_count++;
++  }
++
+   {
+     std::unique_lock<std::mutex> guard(frames_mutex_);
+     frames_queued_.push(output_frame);
+@@ -146,8 +153,13 @@ void SDLAudioDriver::SDLCallback(void* userdata, Uint8* stream, int len) {
+   assert_true(len ==
+               static_cast<int>(sizeof(float) * channel_samples_ * driver->sdl_device_channels_));
+ 
++  static uint32_t sdl_callback_count = 0;
+   std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+   if (driver->frames_queued_.empty()) {
++    if (sdl_callback_count < 10) {
++      REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
++      sdl_callback_count++;
++    }
+     std::memset(stream, 0, len);
+   } else {
+     auto buffer = driver->frames_queued_.front();
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 76e589e..a974e5a 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -27,6 +27,7 @@ extern "C" {
+ #pragma warning(disable : 4101 4244 5033)
+ #endif
+ #include "libavcodec/avcodec.h"
++#include "libavutil/error.h"
+ #if REX_COMPILER_MSVC
+ #pragma warning(pop)
+ #endif
+@@ -39,21 +40,16 @@ namespace rex::audio {
+ 
+ using stream::BitStream;
+ 
+-XmaContext::XmaContext() = default;
++XmaContext::XmaContext()
++    : work_completion_event_(rex::thread::Event::CreateAutoResetEvent(false)) {}
+ 
+ XmaContext::~XmaContext() {
+   if (av_context_) {
+-    if (avcodec_is_open(av_context_)) {
+-      avcodec_close(av_context_);
+-    }
+-    av_free(av_context_);
++    avcodec_free_context(&av_context_);
+   }
+   if (av_frame_) {
+     av_frame_free(&av_frame_);
+   }
+-  // if (current_frame_) {
+-  //   delete[] current_frame_;
+-  //  }
+ }
+ 
+ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+@@ -64,6 +60,7 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+   // Allocate ffmpeg stuff:
+   av_packet_ = av_packet_alloc();
+   assert_not_null(av_packet_);
++  av_packet_->buf = av_buffer_alloc(128 * 1024);
+ 
+   // find the XMA2 audio decoder
+   av_codec_ = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
+@@ -93,35 +90,66 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+ }
+ 
+ bool XmaContext::Work() {
+-  std::lock_guard<std::mutex> lock(lock_);
+   if (!is_allocated() || !is_enabled()) {
+     return false;
+   }
+ 
++  std::lock_guard<std::mutex> lock(lock_);
+   set_is_enabled(false);
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+-  Decode(&data);
+-  data.Store(context_ptr);
+-  return true;
+-}
++  const XMA_CONTEXT_DATA initial_data = data;
+ 
+-void XmaContext::Enable() {
+-  std::lock_guard<std::mutex> lock(lock_);
++  if (!data.output_buffer_valid) {
++    return true;
++  }
+ 
+-  auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+-  XMA_CONTEXT_DATA data(context_ptr);
++  memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+ 
+-  REXAPU_TRACE("XmaContext: kicking context {} (buffer {} {}/{} bits)", id(),
+-               static_cast<uint32_t>(data.current_buffer),
+-               static_cast<uint32_t>(data.input_buffer_read_offset),
+-               (data.current_buffer == 0 ? data.input_buffer_0_packet_count
+-                                         : data.input_buffer_1_packet_count) *
+-                   kBitsPerPacket);
++  // Consume-only context: no input, just drain remaining subframes.
++  if (data.IsConsumeOnlyContext()) {
++    if (current_frame_remaining_subframes_ == 0) {
++      return true;
++    }
++    Consume(&output_rb, &data);
++    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++    StoreContextMerged(data, initial_data, context_ptr);
++    return true;
++  }
+ 
+-  data.Store(context_ptr);
++  // Minimum free blocks needed before attempting a decode.
++  // Use subframe_decode_count (clamped to 1) instead of full frame size.
++  const uint32_t effective_sdc = std::max(static_cast<uint32_t>(1), data.subframe_decode_count);
++  const int32_t minimum_subframe_decode_count =
++      static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
++
++  if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
++    StoreContextMerged(data, initial_data, context_ptr);
++    return true;
++  }
++
++  while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
++    Decode(&data);
++    Consume(&output_rb, &data);
++
++    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
++      break;
++    }
++  }
++
++  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++
++  if (output_rb.empty()) {
++    data.output_buffer_valid = 0;
++  }
++
++  StoreContextMerged(data, initial_data, context_ptr);
++  return true;
++}
+ 
++void XmaContext::Enable() {
++  std::lock_guard<std::mutex> lock(lock_);
+   set_is_enabled(true);
+ }
+ 
+@@ -142,685 +170,592 @@ void XmaContext::Clear() {
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
++  ClearLocked(&data);
++  data.Store(context_ptr);
++}
+ 
+-  data.input_buffer_0_valid = 0;
+-  data.input_buffer_1_valid = 0;
+-  data.output_buffer_valid = 0;
++void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
++  data->input_buffer_0_valid = 0;
++  data->input_buffer_1_valid = 0;
++  data->output_buffer_valid = 0;
+ 
+-  data.output_buffer_read_offset = 0;
+-  data.output_buffer_write_offset = 0;
++  data->input_buffer_read_offset = kBitsPerPacketHeader;
++  data->output_buffer_read_offset = 0;
++  data->output_buffer_write_offset = 0;
+ 
+-  data.Store(context_ptr);
++  current_frame_remaining_subframes_ = 0;
++  loop_frame_output_limit_ = 0;
++  loop_start_skip_pending_ = false;
++  pending_packet_skip_ = 0;
+ }
+ 
+ void XmaContext::Disable() {
+   std::lock_guard<std::mutex> lock(lock_);
+-  REXAPU_TRACE("XmaContext: disabling context {}", id());
+   set_is_enabled(false);
+ }
+ 
+ void XmaContext::Release() {
+-  // Lock it in case the decoder thread is working on it now.
+   std::lock_guard<std::mutex> lock(lock_);
+   assert_true(is_allocated_ == true);
+ 
+   set_is_allocated(false);
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+-  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
++  std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
+ }
+ 
+ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
+-  // No more frames.
+   if (data->current_buffer == 0) {
+     data->input_buffer_0_valid = 0;
+   } else {
+     data->input_buffer_1_valid = 0;
+   }
+   data->current_buffer ^= 1;
+-  data->input_buffer_read_offset = 0;
++  data->input_buffer_read_offset = kBitsPerPacketHeader;
+ }
+ 
+-bool XmaContext::TrySetupNextLoop(XMA_CONTEXT_DATA* data, bool ignore_input_buffer_offset) {
+-  // Setup the input buffer offset if next loop exists.
+-  // TODO(Pseudo-Kernel): Need to handle loop in the following cases.
+-  // 1. loop_start == loop_end == 0
+-  // 2. loop_start > loop_end && loop_count > 0
+-  if (data->loop_count > 0 && data->loop_start < data->loop_end &&
+-      (ignore_input_buffer_offset || data->input_buffer_read_offset >= data->loop_end)) {
+-    // Loop back to the beginning.
+-    data->input_buffer_read_offset = data->loop_start;
+-    if (data->loop_count < 255) {
+-      data->loop_count--;
+-    }
+-    return true;
++void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
++  if (data->loop_count == 0) {
++    return;
+   }
+-  return false;
+-}
+ 
+-/*
+-void XmaContext::NextPacket(
+-    uint8_t* input_buffer,
+-    uint32_t input_size,
+-    uint32_t input_buffer_read_offset) {
+-*/
+-void XmaContext::NextPacket(XMA_CONTEXT_DATA* data) {
+-  // auto packet_idx = GetFramePacketNumber(input_buffer, input_size,
+-  // input_buffer_read_offset);
++  const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
++  const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
++
++  if (data->input_buffer_read_offset != loop_end) {
++    return;
++  }
++
++  data->input_buffer_read_offset = loop_start;
++  loop_start_skip_pending_ = true;
+ 
+-  // packet_idx++;
+-  // if (packet_idx++ >= input_size)
++  if (data->loop_count < 255) {
++    data->loop_count--;
++  }
+ }
+ 
+ int XmaContext::GetSampleRate(int id) {
+-  switch (id) {
+-    case 0:
+-      return 24000;
+-    case 1:
+-      return 32000;
+-    case 2:
+-      return 44100;
+-    case 3:
+-      return 48000;
+-  }
+-  assert_always();
+-  return 0;
++  return kIdToSampleRate[std::min(id, 3)];
+ }
+ 
+-bool XmaContext::ValidFrameOffset(uint8_t* block, size_t size_bytes, size_t frame_offset_bits) {
+-  uint32_t packet_num = GetFramePacketNumber(block, size_bytes, frame_offset_bits);
+-  if (packet_num == -1) {
+-    // Invalid packet number
+-    return false;
++int16_t XmaContext::GetPacketNumber(size_t size, size_t bit_offset) {
++  if (bit_offset < kBitsPerPacketHeader) {
++    assert_always();
++    return -1;
++  }
++  if (bit_offset >= (size << 3)) {
++    assert_always();
++    return -1;
+   }
++  size_t byte_offset = bit_offset >> 3;
++  size_t packet_number = byte_offset / kBytesPerPacket;
++  return static_cast<int16_t>(packet_number);
++}
+ 
+-  uint8_t* packet = block + (packet_num * kBytesPerPacket);
+-  size_t relative_offset_bits = frame_offset_bits % kBitsPerPacket;
++uint32_t XmaContext::GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data) {
++  return data->GetCurrentInputBufferPacketCount() * kBytesPerPacket;
++}
+ 
+-  uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
+-  if (first_frame_offset == -1 || first_frame_offset > kBitsPerPacket) {
+-    // Packet only contains a partial frame, so no frames can start here.
+-    return false;
++uint8_t* XmaContext::GetCurrentInputBuffer(XMA_CONTEXT_DATA* data) {
++  return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
++}
++
++uint32_t XmaContext::GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size) {
++  return std::min(remaining_stream_bits, frame_size);
++}
++
++const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
++                                         uint32_t current_input_packet_count) {
++  if (next_packet_index < current_input_packet_count) {
++    return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
++           next_packet_index * kBytesPerPacket;
+   }
+ 
+-  BitStream stream(packet, kBitsPerPacket);
+-  stream.SetOffset(first_frame_offset);
+-  while (true) {
+-    if (stream.offset_bits() == relative_offset_bits) {
+-      return true;
+-    }
++  const uint8_t next_buffer_index = data->current_buffer ^ 1;
++  if (!data->IsInputBufferValid(next_buffer_index)) {
++    return nullptr;
++  }
+ 
+-    if (stream.BitsRemaining() < 15) {
+-      // Not enough room for another frame header.
+-      return false;
+-    }
++  const uint32_t next_buffer_address = data->GetInputBufferAddress(next_buffer_index);
++  if (!next_buffer_address) {
++    REXAPU_ERROR("XmaContext {}: Buffer marked valid but has null pointer!", id());
++    return nullptr;
++  }
+ 
+-    uint64_t size = stream.Read(15);
+-    if ((size - 15) > stream.BitsRemaining()) {
+-      // Last frame.
+-      return false;
+-    } else if (size == 0x7FFF) {
+-      // Invalid frame (and last of this packet)
++  // Parche: en pistas intercaladas (varias pistas en el mismo bufer), el siguiente
++  // paquete de ESTA pista no siempre es el paquete 0 del bufer siguiente: el salto
++  // continua donde quedo.
++  const uint32_t carry = next_packet_index - current_input_packet_count;
++  if (carry >= data->GetInputBufferPacketCount(next_buffer_index)) {
++    return nullptr;
++  }
++  return memory()->TranslatePhysical(next_buffer_address) + carry * kBytesPerPacket;
++}
++
++// Parche: busca el inicio de trama de ESTA pista a partir del paquete 'packet_index'.
++// Devuelve false si no hay ninguno (sin confundir "no encontrado" con el offset 32) y, si
++// el salto se pasa del final del bufer, cuantos paquetes quedan para el bufer siguiente.
++bool XmaContext::FindFrameStart(const uint8_t* buffer, uint32_t packet_index,
++                                uint32_t packet_count, uint32_t* out_offset,
++                                uint32_t* out_carry) {
++  *out_carry = 0;
++  while (packet_index < packet_count) {
++    const uint8_t* packet = buffer + packet_index * kBytesPerPacket;
++    const uint32_t frame_offset = xma::GetPacketFrameOffset(packet);
++    if (frame_offset <= kMaxFrameSizeinBits) {
++      *out_offset = packet_index * kBitsPerPacket + frame_offset;
++      return true;
++    }
++    // En este paquete no empieza ninguna trama: seguir el salto de ESTA pista
++    // (como Xenia Canary actual) en vez de pasar al paquete contiguo, que puede
++    // ser de otra pista.
++    const uint8_t skip = xma::GetPacketSkipCount(packet);
++    if (skip == 0xFF) {
+       return false;
+     }
++    packet_index += skip + 1u;
++  }
++  *out_carry = packet_index - packet_count;
++  return false;
++}
+ 
+-    stream.Advance(size - 16);
++uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
++                                             uint32_t current_input_packet_count) {
++  while (next_packet_index < current_input_packet_count) {
++    uint8_t* next_packet = buffer + (next_packet_index * kBytesPerPacket);
++    const uint32_t packet_frame_offset = xma::GetPacketFrameOffset(next_packet);
+ 
+-    // Read the trailing bit to see if frames follow
+-    if (stream.Read(1) == 0) {
++    if (packet_frame_offset <= kMaxFrameSizeinBits) {
++      return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
++    }
++    // Parche: seguir el salto de esta pista (ver FindFrameStart).
++    const uint8_t next_skip = xma::GetPacketSkipCount(next_packet);
++    if (next_skip == 0xFF) {
+       break;
+     }
++    next_packet_index += next_skip + 1u;
+   }
+ 
+-  return false;
++  return kBitsPerPacketHeader;
+ }
+ 
+-static void dump_raw(AVFrame* frame, int id) {
+-  FILE* outfile = fopen(fmt::format("out{}.raw", id).c_str(), "ab");
+-  if (!outfile) {
+-    return;
+-  }
+-  size_t data_size = sizeof(float);
+-  for (int i = 0; i < frame->nb_samples; i++) {
+-    for (int ch = 0; ch < frame->channels; ch++) {
+-      fwrite(frame->data[ch] + data_size * i, 1, data_size, outfile);
+-    }
+-  }
+-  fclose(outfile);
+-}
++memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
++  const uint32_t output_capacity = data->output_buffer_block_count * kOutputBytesPerBlock;
++  const uint32_t output_read_offset = data->output_buffer_read_offset * kOutputBytesPerBlock;
++  const uint32_t output_write_offset = data->output_buffer_write_offset * kOutputBytesPerBlock;
+ 
+-void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+-  SCOPE_profile_cpu_f("apu");
++  if (output_capacity > kOutputMaxSizeBytes) {
++    REXAPU_WARN(
++        "XmaContext {}: Output buffer exceeds expected size! "
++        "(Actual: {} Max: {})",
++        id(), output_capacity, kOutputMaxSizeBytes);
++  }
+ 
+-  // What I see:
+-  // XMA outputs 2 bytes per sample
+-  // 512 samples per frame (128 per subframe)
+-  // Max output size is data.output_buffer_block_count * 256
++  uint8_t* output_buffer = memory()->TranslatePhysical(data->output_buffer_ptr);
+ 
+-  // This decoder is fed packets (max 4095 per buffer)
+-  // Packets contain "some" frames
+-  // 32bit header (big endian)
++  memory::RingBuffer output_rb(output_buffer, output_capacity);
++  output_rb.set_read_offset(output_read_offset);
++  output_rb.set_write_offset(output_write_offset);
++  remaining_subframe_blocks_in_output_buffer_ =
++      static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
+ 
+-  // Frames are the smallest thing the SPUs can decode.
+-  // They can and usually will span packets.
++  return output_rb;
++}
+ 
+-  // Sample rates (data.sample_rate):
+-  // 0 - 24 kHz
+-  // 1 - 32 kHz
+-  // 2 - 44.1 kHz
+-  // 3 - 48 kHz
++kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
++  kPacketInfo packet_info = {};
+ 
+-  // SPUs also support stereo decoding. (data.is_stereo)
++  const uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
++  BitStream stream(packet, kBitsPerPacket);
++  stream.SetOffset(first_frame_offset);
+ 
+-  // Check the output buffer - we cannot decode anything else if it's
+-  // unavailable.
+-  if (!data->output_buffer_valid) {
+-    return;
++  if (frame_offset < first_frame_offset) {
++    packet_info.current_frame_ = 0;
++    packet_info.current_frame_size_ = first_frame_offset - frame_offset;
+   }
+ 
+-  // No available data.
+-  if (!data->input_buffer_0_valid && !data->input_buffer_1_valid) {
+-    data->output_buffer_valid = 0;
+-    return;
+-  }
++  while (true) {
++    if (stream.BitsRemaining() < kBitsPerFrameHeader) {
++      break;
++    }
+ 
+-  // XAudio Loops
+-  // loop_count:
+-  //  - XAUDIO2_MAX_LOOP_COUNT = 254
+-  //  - XAUDIO2_LOOP_INFINITE = 255
+-  // loop_start/loop_end are bit offsets to a specific frame
+-
+-  // Translate pointers for future use.
+-  // Sometimes the game will use rolling input buffers. If they do, we cannot
+-  // assume they form a complete block! In addition, the buffers DO NOT have
+-  // to be contiguous!
+-  uint8_t* in0 =
+-      data->input_buffer_0_valid ? memory()->TranslatePhysical(data->input_buffer_0_ptr) : nullptr;
+-  uint8_t* in1 =
+-      data->input_buffer_1_valid ? memory()->TranslatePhysical(data->input_buffer_1_ptr) : nullptr;
+-  uint8_t* current_input_buffer = data->current_buffer ? in1 : in0;
+-
+-  REXAPU_TRACE("Processing context {} (offset {}, buffer {}, ptr {:p})", id(),
+-               static_cast<uint32_t>(data->input_buffer_read_offset),
+-               static_cast<uint32_t>(data->current_buffer),
+-               static_cast<void*>(current_input_buffer));
+-
+-  size_t input_buffer_0_size = data->input_buffer_0_packet_count * kBytesPerPacket;
+-  size_t input_buffer_1_size = data->input_buffer_1_packet_count * kBytesPerPacket;
+-  size_t input_total_size = input_buffer_0_size + input_buffer_1_size;
+-
+-  size_t current_input_size = data->current_buffer ? input_buffer_1_size : input_buffer_0_size;
+-  size_t current_input_packet_count = current_input_size / kBytesPerPacket;
+-
+-  // Output buffers are in raw PCM samples, 256 bytes per block.
+-  // Output buffer is a ring buffer. We need to write from the write offset
+-  // to the read offset.
+-  uint8_t* output_buffer = memory()->TranslatePhysical(data->output_buffer_ptr);
+-  uint32_t output_capacity = data->output_buffer_block_count * kBytesPerSubframeChannel;
+-  uint32_t output_read_offset = data->output_buffer_read_offset * kBytesPerSubframeChannel;
+-  uint32_t output_write_offset = data->output_buffer_write_offset * kBytesPerSubframeChannel;
++    const uint64_t frame_size = stream.Peek(kBitsPerFrameHeader);
++    if (frame_size == 0 || frame_size == xma::kMaxFrameLength) {
++      break;
++    }
+ 
+-  memory::RingBuffer output_rb(output_buffer, output_capacity);
+-  output_rb.set_read_offset(output_read_offset);
+-  output_rb.set_write_offset(output_write_offset);
++    if (stream.offset_bits() == frame_offset) {
++      packet_info.current_frame_ = packet_info.frame_count_;
++      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
++    }
+ 
+-  // We can only decode an entire frame and write it out at a time, so
+-  // don't save any samples.
+-  // TODO(JoelLinn): subframes when looping
+-  size_t output_remaining_bytes = output_rb.write_count();
+-  output_remaining_bytes -= output_remaining_bytes % (kBytesPerFrameChannel << data->is_stereo);
+-
+-  // is_dirty_ = true; // TODO
+-  // is_dirty_ = false;  // TODO
+-  assert_false(data->stop_when_done);
+-  assert_false(data->interrupt_when_done);
+-  static int total_samples = 0;
+-  bool reuse_input_buffer = false;
+-  // Decode until we can't write any more data.
+-  while (output_remaining_bytes > 0) {
+-    if (!data->input_buffer_0_valid && !data->input_buffer_1_valid) {
+-      // Out of data.
++    packet_info.frame_count_++;
++
++    if (frame_size > stream.BitsRemaining()) {
+       break;
+     }
+ 
+-    // Setup the input buffer if we are at loop_end.
+-    // The input buffer must not be swapped out until all loops are processed.
+-    reuse_input_buffer = TrySetupNextLoop(data, false);
+-
+-    // assert_true(packets_skip_ == 0);
+-    // assert_true(split_frame_len_ == 0);
+-    // assert_true(split_frame_len_partial_ == 0);
+-
+-    // Where are we in the buffer (in XMA jargon)
+-    int packet_idx, frame_idx, frame_count;
+-    uint8_t* packet;
+-    bool frame_last_split;
+-
+-    BitStream stream(current_input_buffer, current_input_size * 8);
+-    stream.SetOffset(data->input_buffer_read_offset);
+-
+-    // if we had a buffer swap try to skip packets first
+-    if (packets_skip_ > 0) {
+-      packet_idx = GetFramePacketNumber(current_input_buffer, current_input_size,
+-                                        data->input_buffer_read_offset);
+-      while (packets_skip_ > 0) {
+-        packets_skip_--;
+-        packet_idx++;
+-        if (packet_idx >= current_input_packet_count) {
+-          if (!reuse_input_buffer) {
+-            // Last packet. Try setup once more.
+-            reuse_input_buffer = TrySetupNextLoop(data, true);
+-          }
+-          if (!reuse_input_buffer) {
+-            SwapInputBuffer(data);
+-          }
+-          return;
+-        }
+-      }
+-      // invalid frame pointer but needed for us
+-      data->input_buffer_read_offset = packet_idx * kBitsPerPacket;
+-      // continue;
++    stream.Advance(frame_size - 1);
++
++    if (stream.Read(1) == 0) {
++      break;
+     }
++  }
+ 
+-    if (split_frame_len_) {
+-      // handle a frame that was split over two packages
+-      packet_idx = GetFramePacketNumber(current_input_buffer, current_input_size,
+-                                        data->input_buffer_read_offset);
+-      packet = current_input_buffer + packet_idx * kBytesPerPacket;
+-      std::tie(frame_count, frame_last_split) = GetPacketFrameCount(packet);
+-      frame_idx = -1;
+-
+-      stream = BitStream(current_input_buffer, (packet_idx + 1) * kBitsPerPacket);
+-      stream.SetOffset(packet_idx * kBitsPerPacket + 32);
+-
+-      if (split_frame_len_ > xma::kMaxFrameLength) {
+-        // TODO write CopyPeekMethod
+-        auto offset = stream.offset_bits();
+-        stream.Copy(
+-            xma_frame_.data() + 1 + ((split_frame_len_partial_ + split_frame_padding_start_) / 8),
+-            15 - split_frame_len_partial_);
+-        stream.SetOffset(offset);
+-        BitStream slen(xma_frame_.data() + 1, 15 + split_frame_padding_start_);
+-        slen.Advance(split_frame_padding_start_);
+-        split_frame_len_ = static_cast<int>(slen.Read(15));
++  if (xma::IsPacketXma2Type(packet)) {
++    const uint8_t xma2_frame_count = xma::GetPacketFrameCount(packet);
++    if (xma2_frame_count > packet_info.frame_count_) {
++      if (packet_info.current_frame_size_ == 0) {
++        packet_info.current_frame_ = packet_info.frame_count_;
+       }
++      packet_info.frame_count_ = xma2_frame_count;
++    }
++  }
++  return packet_info;
++}
+ 
+-      if (frame_count > 0) {
+-        assert_true(xma::GetPacketFrameOffset(packet) - 32 ==
+-                    split_frame_len_ - split_frame_len_partial_);
+-      }
++void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
++                                    const XMA_CONTEXT_DATA& initial_data, uint8_t* context_ptr) {
++  XMA_CONTEXT_DATA fresh(context_ptr);
+ 
+-      auto offset = stream.Copy(
+-          xma_frame_.data() + 1 + ((split_frame_len_partial_ + split_frame_padding_start_) / 8),
+-          split_frame_len_ - split_frame_len_partial_);
+-      assert_true(offset == (split_frame_padding_start_ + split_frame_len_partial_) % 8);
+-    } else {
+-      if (data->input_buffer_read_offset % kBitsPerPacket == 0) {
+-        // Invalid offset. Go ahead and set it.
+-        int packet_number = GetFramePacketNumber(current_input_buffer, current_input_size,
+-                                                 data->input_buffer_read_offset);
+-
+-        if (packet_number == -1) {
+-          return;
+-        }
+-
+-        auto offset =
+-            xma::GetPacketFrameOffset(current_input_buffer + kBytesPerPacket * packet_number) +
+-            data->input_buffer_read_offset;
+-        if (offset == -1) {
+-          // No more frames.
+-          SwapInputBuffer(data);
+-          // TODO partial frames? end?
+-          REXAPU_ERROR("XmaContext {}: TODO partial frames? end?", id());
+-          assert_always("TODO");
+-          return;
+-        } else {
+-          data->input_buffer_read_offset = offset;
+-        }
+-      }
++  fresh.loop_count = data.loop_count;
++  fresh.output_buffer_write_offset = data.output_buffer_write_offset;
++  if (initial_data.input_buffer_0_valid && !data.input_buffer_0_valid) {
++    fresh.input_buffer_0_valid = 0;
++  }
++  if (initial_data.input_buffer_1_valid && !data.input_buffer_1_valid) {
++    fresh.input_buffer_1_valid = 0;
++  }
+ 
+-      if (!ValidFrameOffset(current_input_buffer, current_input_size,
+-                            data->input_buffer_read_offset)) {
+-        REXAPU_DEBUG("XmaContext {}: Invalid read offset {}!", id(),
+-                     static_cast<uint32_t>(data->input_buffer_read_offset));
+-        SwapInputBuffer(data);
+-        return;
+-      }
++  if (initial_data.output_buffer_valid && !data.output_buffer_valid) {
++    fresh.output_buffer_valid = 0;
++  }
+ 
+-      // Where are we in the buffer (in XMA jargon)
+-      std::tie(packet_idx, frame_idx) =
+-          GetFrameNumber(current_input_buffer, current_input_size, data->input_buffer_read_offset);
+-      // TODO handle
+-      assert_true(packet_idx >= 0);
+-      assert_true(frame_idx >= 0);
+-      packet = current_input_buffer + packet_idx * kBytesPerPacket;
+-      // frames that belong to this packet
+-      std::tie(frame_count, frame_last_split) = GetPacketFrameCount(packet);
+-      assert_true(frame_count >= 0);  // TODO end
+-
+-      PrepareDecoder(packet, data->sample_rate, bool(data->is_stereo));
+-
+-      // Current frame is split to next packet:
+-      bool frame_is_split = frame_last_split && (frame_idx >= frame_count - 1);
+-
+-      stream = BitStream(current_input_buffer, (packet_idx + 1) * kBitsPerPacket);
+-      stream.SetOffset(data->input_buffer_read_offset);
+-      // int frame_len;
+-      // int frame_len_partial
+-      split_frame_len_partial_ = static_cast<int>(stream.BitsRemaining());
+-      if (split_frame_len_partial_ >= 15) {
+-        split_frame_len_ = static_cast<int>(stream.Peek(15));
+-      } else {
+-        // assert_always();
+-        split_frame_len_ = xma::kMaxFrameLength + 1;
+-      }
+-      assert_true(frame_is_split == (split_frame_len_ > split_frame_len_partial_));
++  fresh.input_buffer_read_offset = data.input_buffer_read_offset;
++  fresh.error_status = data.error_status;
++  fresh.current_buffer = data.current_buffer;
++  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+ 
+-      // TODO fix bitstream copy
+-      std::memset(xma_frame_.data(), 0, xma_frame_.size());
++  fresh.Store(context_ptr);
++}
+ 
+-      {
+-        auto offset = stream.Copy(xma_frame_.data() + 1,
+-                                  std::min(split_frame_len_, split_frame_len_partial_));
+-        assert_true(offset < 8);
+-        split_frame_padding_start_ = static_cast<uint8_t>(offset);
+-      }
++void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
++  if (!current_frame_remaining_subframes_) {
++    return;
++  }
+ 
+-      if (frame_is_split) {
+-        // go to next xma packet of this stream
+-        packets_skip_ = xma::GetPacketSkipCount(packet) + 1;
+-        while (packets_skip_ > 0) {
+-          packets_skip_--;
+-          packet += kBytesPerPacket;
+-          packet_idx++;
+-          if (packet_idx >= current_input_packet_count) {
+-            if (!reuse_input_buffer) {
+-              // Last packet. Try setup once more.
+-              reuse_input_buffer = TrySetupNextLoop(data, true);
+-            }
+-            if (!reuse_input_buffer) {
+-              SwapInputBuffer(data);
+-            }
+-            return;
+-          }
+-        }
+-        // TODO guest might read this:
+-        data->input_buffer_read_offset = packet_idx * kBitsPerPacket;
+-        continue;
+-      }
++  if (loop_frame_output_limit_ > 0) {
++    const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
++                                    << data->is_stereo;
++    const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
++    if (consumed >= loop_frame_output_limit_) {
++      remaining_subframe_blocks_in_output_buffer_ -= data->output_buffer_padding;
++      current_frame_remaining_subframes_ = 0;
++      loop_frame_output_limit_ = 0;
++      return;
+     }
++  }
+ 
+-    av_packet_->data = xma_frame_.data();
+-    av_packet_->size =
+-        static_cast<int>(1 + ((split_frame_padding_start_ + split_frame_len_) / 8) +
+-                         (((split_frame_padding_start_ + split_frame_len_) % 8) ? 1 : 0));
++  const uint8_t effective_sdc = std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
++  int8_t subframes_to_write = std::min(static_cast<int8_t>(current_frame_remaining_subframes_),
++                                       static_cast<int8_t>(effective_sdc));
+ 
+-    auto padding_end = av_packet_->size * 8 - (8 + split_frame_padding_start_ + split_frame_len_);
+-    assert_true(padding_end < 8);
+-    xma_frame_[0] = ((split_frame_padding_start_ & 7) << 5) | ((padding_end & 7) << 2);
++  if (loop_frame_output_limit_ > 0) {
++    const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
++                                    << data->is_stereo;
++    const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
++    const int8_t remaining_until_limit = static_cast<int8_t>(loop_frame_output_limit_ - consumed);
++    if (subframes_to_write > remaining_until_limit) {
++      subframes_to_write = remaining_until_limit;
++    }
++  }
+ 
+-    split_frame_len_ = 0;
+-    split_frame_len_partial_ = 0;
+-    split_frame_padding_start_ = 0;
++  const int8_t raw_frame_read_offset =
++      ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
++      current_frame_remaining_subframes_;
+ 
+-    auto ret = avcodec_send_packet(av_context_, av_packet_);
+-    if (ret < 0) {
+-      REXAPU_ERROR("XmaContext {}: Error sending packet for decoding", id());
+-      // TODO bail out
+-      assert_always();
+-    }
+-    ret = avcodec_receive_frame(av_context_, av_frame_);
+-    /*
+-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+-      // TODO AVERROR_EOF???
+-      break;
+-    else
+-    */
+-    if (ret < 0) {
+-      REXAPU_ERROR("XmaContext {}: Error during decoding", id());
+-      assert_always();
+-      return;  // TODO bail out
+-    }
+-    assert_true(ret == 0);
+-
+-    {
+-      // copy over 1 frame
+-      // update input buffer read offset
+-
+-      // assert(decoded_consumed_samples_ + kSamplesPerFrame <=
+-      //       current_frame_.size());
+-      assert_true(av_context_->sample_fmt == AV_SAMPLE_FMT_FLTP);
+-      // assert_true(frame_is_split == (frame_idx == -1));
+-
+-      //			dump_raw(av_frame_, id());
+-      ConvertFrame((const uint8_t**)av_frame_->data, bool(data->is_stereo), raw_frame_.data());
+-      // decoded_consumed_samples_ += kSamplesPerFrame;
+-
+-      auto byte_count = kBytesPerFrameChannel << data->is_stereo;
+-      assert_true(output_remaining_bytes >= byte_count);
+-      output_rb.Write(raw_frame_.data(), byte_count);
+-      output_remaining_bytes -= byte_count;
+-      data->output_buffer_write_offset = output_rb.write_offset() / 256;
+-
+-      total_samples += id_ == 0 ? kSamplesPerFrame : 0;
+-
+-      uint32_t offset = data->input_buffer_read_offset;
+-      // if (offset % (kBytesPerSample * 8) == 0) {
+-      //  offset = xma::GetPacketFrameOffset(packet);
+-      //}
+-      offset =
+-          static_cast<uint32_t>(GetNextFrame(current_input_buffer, current_input_size, offset));
+-      // assert_true((offset == 0) ==
+-      //            (frame_is_split || (frame_idx + 1 >= frame_count)));
+-      if (frame_idx + 1 >= frame_count) {
+-        // Skip to next packet (no split frame)
+-        packets_skip_ = xma::GetPacketSkipCount(packet) + 1;
+-        while (packets_skip_ > 0) {
+-          packets_skip_--;
+-          packet_idx++;
+-          if (packet_idx >= current_input_packet_count) {
+-            if (!reuse_input_buffer) {
+-              // Last packet. Try setup once more.
+-              reuse_input_buffer = TrySetupNextLoop(data, true);
+-            }
+-            if (!reuse_input_buffer) {
+-              SwapInputBuffer(data);
+-            }
+-            return;
+-          }
+-        }
+-        packet = current_input_buffer + packet_idx * kBytesPerPacket;
+-        offset = xma::GetPacketFrameOffset(packet) + packet_idx * kBitsPerPacket;
+-      }
+-      if (offset == 0 || frame_idx == -1) {
+-        // Next packet but we already skipped to it
+-        if (packet_idx >= current_input_packet_count) {
+-          // Buffer is fully used
+-          if (!reuse_input_buffer) {
+-            // Last packet. Try setup once more.
+-            reuse_input_buffer = TrySetupNextLoop(data, true);
+-          }
+-          if (!reuse_input_buffer) {
+-            SwapInputBuffer(data);
+-          }
+-          break;
+-        }
+-        offset = xma::GetPacketFrameOffset(packet) + packet_idx * kBitsPerPacket;
+-      }
+-      // TODO buffer bounds check
+-      assert_true(data->input_buffer_read_offset < offset);
+-      data->input_buffer_read_offset = offset;
++  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
++                   subframes_to_write * kOutputBytesPerBlock);
++
++  const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
++                              ? data->output_buffer_padding
++                              : 0;
++
++  remaining_subframe_blocks_in_output_buffer_ -= subframes_to_write + headroom;
++  current_frame_remaining_subframes_ -= subframes_to_write;
++}
++
++int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
++  sample_rate = GetSampleRate(sample_rate);
++
++  uint32_t channels = is_two_channel ? 2 : 1;
++  if (av_context_->sample_rate != sample_rate ||
++      av_context_->channels != static_cast<int>(channels)) {
++    REXAPU_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
++                 av_context_->sample_rate, sample_rate, av_context_->channels, channels);
++    avcodec_free_context(&av_context_);
++    av_context_ = avcodec_alloc_context3(av_codec_);
++
++    av_context_->sample_rate = sample_rate;
++    av_context_->channels = channels;
++    av_context_->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
++
++    if (avcodec_open2(av_context_, av_codec_, NULL) < 0) {
++      REXAPU_ERROR("XmaContext: Failed to reopen FFmpeg context");
++      return -1;
+     }
++    return 1;
+   }
++  return 0;
++}
++
++void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
++  av_packet_->data = xma_frame_.data();
++  av_packet_->size = static_cast<int>(1 + ((frame_padding + frame_size) / 8) +
++                                      (((frame_padding + frame_size) % 8) ? 1 : 0));
+ 
+-  // assert_true((split_frame_len_ != 0) == (data->input_buffer_read_offset ==
+-  // 0));
++  auto padding_end = av_packet_->size * 8 - (8 + frame_padding + frame_size);
++  assert_true(padding_end < 8);
++  xma_frame_[0] = ((frame_padding & 7) << 5) | ((padding_end & 7) << 2);
++}
++
++bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
++                              AVFrame* av_frame) {
++  auto ret = avcodec_send_packet(av_context, av_packet);
++  if (ret < 0) {
++    char errbuf[AV_ERROR_MAX_STRING_SIZE];
++    av_strerror(ret, errbuf, sizeof(errbuf));
++    REXAPU_ERROR("XmaContext {}: Error sending packet for decoding: {} ({})", id(), errbuf, ret);
++    return false;
++  }
++  ret = avcodec_receive_frame(av_context, av_frame);
+ 
+-  // The game will kick us again with a new output buffer later.
+-  // It's important that we only invalidate this if we actually wrote to it!!
+-  if (output_rb.write_offset() == output_rb.read_offset()) {
+-    data->output_buffer_valid = 0;
++  if (ret == AVERROR(EAGAIN)) {
++    return false;
++  }
++  if (ret < 0) {
++    char errbuf[AV_ERROR_MAX_STRING_SIZE];
++    av_strerror(ret, errbuf, sizeof(errbuf));
++    REXAPU_ERROR("XmaContext {}: Error during decoding: {} ({})", id(), errbuf, ret);
++    return false;
+   }
++  return true;
+ }
+ 
+-size_t XmaContext::GetNextFrame(uint8_t* block, size_t size, size_t bit_offset) {
+-  // offset = xma::GetPacketFrameOffset(packet);
+-  // TODO meh
+-  // auto next_packet = bit_offset - bit_offset % kBitsPerPacket +
+-  // kBitsPerPacket;
+-  auto packet_idx = GetFramePacketNumber(block, size, bit_offset);
++void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
++  SCOPE_profile_cpu_f("apu");
+ 
+-  BitStream stream(block, size * 8);
+-  stream.SetOffset(bit_offset);
++  if (!data->IsAnyInputBufferValid()) {
++    return;
++  }
+ 
+-  if (stream.BitsRemaining() < 15) {
+-    return 0;
++  if (current_frame_remaining_subframes_ > 0) {
++    return;
+   }
+ 
+-  uint64_t len = stream.Read(15);
+-  if ((len - 15) > stream.BitsRemaining()) {
+-    // assert_always("TODO");
+-    // *bit_offset = next_packet;
+-    // return false;
+-    // return next_packet;
+-    return 0;
+-  } else if (len >= xma::kMaxFrameLength) {
+-    // assert_always("TODO");
+-    // *bit_offset = next_packet;
+-    // return false;
+-    return 0;
+-    // return next_packet;
++  if (!data->IsCurrentInputBufferValid()) {
++    SwapInputBuffer(data);
++    if (!data->IsCurrentInputBufferValid()) {
++      return;
++    }
+   }
+ 
+-  stream.Advance(len - (15 + 1));
+-  // Read the trailing bit to see if frames follow
+-  if (stream.Read(1) == 0) {
+-    return 0;
++  uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
++
++  // Parche: aplicar el salto de paquetes que quedo pendiente del bufer anterior.
++  if (pending_packet_skip_ > 0) {
++    const uint32_t skip = pending_packet_skip_;
++    pending_packet_skip_ = 0;
++    uint32_t found_offset = 0;
++    uint32_t carry = 0;
++    if (!FindFrameStart(current_input_buffer, skip, data->GetCurrentInputBufferPacketCount(),
++                        &found_offset, &carry)) {
++      pending_packet_skip_ = carry;
++      SwapInputBuffer(data);
++      return;
++    }
++    data->input_buffer_read_offset = found_offset;
+   }
+ 
+-  bit_offset += len;
+-  if (packet_idx < GetFramePacketNumber(block, size, bit_offset)) {
+-    return 0;
++  input_buffer_.fill(0);
++
++  // Detect loop end frame before UpdateLoopStatus resets the offset.
++  bool is_loop_end_frame = false;
++  if (data->loop_count > 0) {
++    const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
++    is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
+   }
+-  return bit_offset;
+-}
+ 
+-int XmaContext::GetFramePacketNumber(uint8_t* block, size_t size, size_t bit_offset) {
+-  size *= 8;
+-  if (bit_offset >= size) {
+-    // Not good :(
+-    assert_always();
+-    return -1;
++  UpdateLoopStatus(data);
++
++  if (!data->output_buffer_block_count) {
++    REXAPU_ERROR("XmaContext {}: Error - Received 0 for output_buffer_block_count!", id());
++    return;
+   }
+ 
+-  size_t byte_offset = bit_offset >> 3;
+-  size_t packet_number = byte_offset / kBytesPerPacket;
++  if (data->input_buffer_read_offset < kBitsPerPacketHeader) {
++    data->input_buffer_read_offset = kBitsPerPacketHeader;
++  }
+ 
+-  return (uint32_t)packet_number;
+-}
++  const uint32_t current_input_size = GetCurrentInputBufferSize(data);
++  const uint32_t current_input_packet_count = current_input_size / kBytesPerPacket;
+ 
+-std::tuple<int, int> XmaContext::GetFrameNumber(uint8_t* block, size_t size, size_t bit_offset) {
+-  auto packet_idx = GetFramePacketNumber(block, size, bit_offset);
++  const int16_t packet_index = GetPacketNumber(current_input_size, data->input_buffer_read_offset);
+ 
+-  if (packet_idx < 0 || (packet_idx + 1) * kBytesPerPacket > size) {
+-    assert_always();
+-    return {packet_idx, -2};
++  if (packet_index == -1) {
++    REXAPU_ERROR("XmaContext {}: Invalid packet index. Input read offset: {}", id(),
++                 static_cast<uint32_t>(data->input_buffer_read_offset));
++    return;
+   }
+ 
+-  if (bit_offset == 0) {
+-    return {packet_idx, -1};
++  uint8_t* packet = current_input_buffer + (packet_index * kBytesPerPacket);
++  const uint32_t packet_first_frame_offset = xma::GetPacketFrameOffset(packet);
++  uint32_t relative_offset = data->input_buffer_read_offset % kBitsPerPacket;
++
++  if (relative_offset < packet_first_frame_offset) {
++    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + packet_first_frame_offset;
++    relative_offset = packet_first_frame_offset;
+   }
+ 
+-  uint8_t* packet = block + (packet_idx * kBytesPerPacket);
+-  auto first_frame_offset = xma::GetPacketFrameOffset(packet);
+-  BitStream stream(block, size * 8);
+-  stream.SetOffset(packet_idx * kBitsPerPacket + first_frame_offset);
++  const uint8_t skip_count = xma::GetPacketSkipCount(packet);
+ 
+-  int frame_idx = 0;
+-  while (true) {
+-    if (stream.BitsRemaining() < 15) {
+-      break;
++  // Full packet skip (0xFF) -- no new frames begin in this packet.
++  if (skip_count == 0xFF) {
++    uint32_t next_input_offset =
++        GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
++    if (next_input_offset == kBitsPerPacketHeader) {
++      SwapInputBuffer(data);
+     }
++    data->input_buffer_read_offset = next_input_offset;
++    return;
++  }
+ 
+-    if (stream.offset_bits() == bit_offset) {
+-      break;
++  kPacketInfo packet_info = GetPacketInfo(packet, relative_offset);
++  const uint32_t packet_to_skip = skip_count + 1;
++  const uint32_t next_packet_index = packet_index + packet_to_skip;
++
++  // Frame header split across packet boundary.
++  if (packet_info.current_frame_size_ == 0) {
++    const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
++    if (!next_packet) {
++      // Parche: seguir en el paquete correcto de esta pista en el bufer siguiente.
++      pending_packet_skip_ = next_packet_index >= current_input_packet_count
++                                 ? next_packet_index - current_input_packet_count
++                                 : 0;
++      SwapInputBuffer(data);
++      return;
+     }
++    std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
++    std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
++                kBytesPerPacketData);
+ 
+-    uint64_t size = stream.Read(15);
+-    if ((size - 15) > stream.BitsRemaining()) {
+-      // Last frame.
+-      break;
+-    } else if (size == 0x7FFF) {
+-      // Invalid frame (and last of this packet)
+-      break;
++    BitStream combined(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
++    combined.SetOffset(relative_offset - kBitsPerPacketHeader);
++
++    uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
++    if (frame_size == xma::kMaxFrameLength) {
++      data->error_status = 4;
++      return;
+     }
++    packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
++  }
+ 
+-    stream.Advance(size - (15 + 1));
++  BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
++  stream.SetOffset(data->input_buffer_read_offset);
+ 
+-    // Read the trailing bit to see if frames follow
+-    if (stream.Read(1) == 0) {
+-      break;
+-    }
+-    frame_idx++;
++  const uint64_t bits_to_copy = GetAmountOfBitsToRead(static_cast<uint32_t>(stream.BitsRemaining()),
++                                                      packet_info.current_frame_size_);
++
++  if (bits_to_copy == 0) {
++    REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
++    SwapInputBuffer(data);
++    return;
+   }
+-  return {packet_idx, frame_idx};
+-}
+ 
+-std::tuple<int, bool> XmaContext::GetPacketFrameCount(uint8_t* packet) {
+-  auto first_frame_offset = xma::GetPacketFrameOffset(packet);
+-  if (first_frame_offset > kBitsPerPacket - kBitsPerHeader) {
+-    // frame offset is beyond packet end
+-    return {0, false};
++  if (packet_info.isLastFrameInPacket()) {
++    if (stream.BitsRemaining() < packet_info.current_frame_size_) {
++      const uint8_t* next_packet =
++          GetNextPacket(data, next_packet_index, current_input_packet_count);
++      if (!next_packet) {
++        data->error_status = 4;
++        return;
++      }
++      std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
++                  kBytesPerPacketData);
++    }
+   }
+ 
+-  BitStream stream(packet, kBitsPerPacket);
+-  stream.SetOffset(first_frame_offset);
+-  int frame_count = 0;
++  std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
+ 
+-  while (true) {
+-    frame_count++;
+-    if (stream.BitsRemaining() < 15) {
+-      return {frame_count, true};
+-    }
++  stream = BitStream(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
++  stream.SetOffset(relative_offset - kBitsPerPacketHeader);
+ 
+-    uint64_t size = stream.Read(15);
+-    if ((size - 15) > stream.BitsRemaining()) {
+-      return {frame_count, true};
+-    } else if (size == 0x7FFF) {
+-      assert_always();
+-      return {frame_count, true};
+-    }
++  xma_frame_.fill(0);
+ 
+-    stream.Advance(size - (15 + 1));
++  const uint32_t padding_start =
++      static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
+ 
+-    if (stream.Read(1) == 0) {
+-      return {frame_count, false};
+-    }
+-  }
+-}
++  raw_frame_.fill(0);
+ 
+-int XmaContext::PrepareDecoder(uint8_t* packet, int sample_rate, bool is_two_channel) {
+-  // Sanity check: Packet metadata is always 1 for XMA2/0 for XMA
+-  assert_true((packet[2] & 0x7) == 1 || (packet[2] & 0x7) == 0);
++  PrepareDecoder(data->sample_rate, bool(data->is_stereo));
++  PreparePacket(packet_info.current_frame_size_, padding_start);
++  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
++    ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
++                 raw_frame_.data());
++    current_frame_remaining_subframes_ = 4 << data->is_stereo;
+ 
+-  sample_rate = GetSampleRate(sample_rate);
++    // Loop end: limit output to subframes 0..loop_subframe_end.
++    if (is_loop_end_frame) {
++      loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
++    } else {
++      loop_frame_output_limit_ = 0;
++    }
+ 
+-  // Re-initialize the context with new sample rate and channels.
+-  uint32_t channels = is_two_channel ? 2 : 1;
+-  if (av_context_->sample_rate != sample_rate || av_context_->channels != channels) {
+-    // We have to reopen the codec so it'll realloc whatever data it needs.
+-    // TODO(DrChat): Find a better way.
+-    avcodec_close(av_context_);
++    // Loop start: skip leading subframes per loop_subframe_skip.
++    if (loop_start_skip_pending_) {
++      const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
++      if (skip < current_frame_remaining_subframes_) {
++        current_frame_remaining_subframes_ -= skip;
++      }
++      loop_start_skip_pending_ = false;
++    }
++  }
+ 
+-    av_context_->sample_rate = sample_rate;
+-    av_context_->channels = channels;
++  // Compute where to go next.
++  if (!packet_info.isLastFrameInPacket()) {
++    const uint32_t next_frame_offset =
++        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
++    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
++    return;
++  }
+ 
+-    if (avcodec_open2(av_context_, av_codec_, NULL) < 0) {
+-      REXAPU_ERROR("XmaContext: Failed to reopen FFmpeg context");
+-      return -1;
++  // Parche: buscar la siguiente trama de ESTA pista. Si el salto se pasa del final
++  // del bufer actual, continuar en el bufer siguiente con los paquetes que faltan
++  // (antes se asumia siempre el paquete 0, y las pistas intercaladas se mezclaban).
++  uint32_t next_input_offset = kBitsPerPacketHeader;
++  uint32_t found_offset = 0;
++  uint32_t carry = 0;
++  if (FindFrameStart(current_input_buffer, next_packet_index, current_input_packet_count,
++                     &found_offset, &carry)) {
++    next_input_offset = found_offset;
++  } else {
++    SwapInputBuffer(data);
++    if (data->IsCurrentInputBufferValid()) {
++      uint8_t* new_buffer = memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
++      const uint32_t new_count = data->GetCurrentInputBufferPacketCount();
++      uint32_t carry2 = 0;
++      if (FindFrameStart(new_buffer, carry, new_count, &found_offset, &carry2)) {
++        next_input_offset = found_offset;
++      } else {
++        pending_packet_skip_ = carry2;
++        SwapInputBuffer(data);
++        return;
++      }
++    } else {
++      // El bufer siguiente todavia no esta listo: recordar el salto para cuando llegue.
++      pending_packet_skip_ = carry;
+     }
+-    return 1;
+   }
+-  return 0;
++  data->input_buffer_read_offset = next_input_offset;
+ }
+ 
+ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index f228692..3dcfcee 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -137,18 +137,16 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+ }
+ 
+ void XmaDecoder::WorkerThreadMain() {
+-  uint32_t idle_loop_count = 0;
+   while (worker_running_) {
+     // Okay, let's loop through XMA contexts to find ones we need to decode!
+     bool did_work = false;
+     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
+       XmaContext& context = contexts_[n];
+-      did_work = context.Work() || did_work;
+-
+-      // TODO: Need thread safety to do this.
+-      // Probably not too important though.
+-      // registers_.current_context = n;
+-      // registers_.next_context = (n + 1) % kContextCount;
++      bool worked = context.Work();
++      if (worked) {
++        context.SignalWorkDone();
++      }
++      did_work = did_work || worked;
+     }
+ 
+     if (paused_) {
+@@ -156,18 +154,11 @@ void XmaDecoder::WorkerThreadMain() {
+       resume_fence_.Wait();
+     }
+ 
+-    if (!did_work) {
+-      idle_loop_count++;
+-    } else {
+-      idle_loop_count = 0;
+-    }
+-
+-    if (idle_loop_count > 500) {
+-      // Idle for an extended period. Introduce a 20ms wait.
+-      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(20));
++    if (did_work) {
++      continue;
+     }
+-
+-    rex::thread::MaybeYield();
++    // No work done this iteration, block until signaled.
++    rex::thread::Wait(work_event_.get(), false);
+   }
+ }
+ 
+@@ -265,9 +256,9 @@ uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
+     default:
+       const auto register_info = register_file_.GetRegisterInfo(r);
+       if (register_info) {
+-        REXAPU_WARN("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
++        REXAPU_DEBUG("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
+       } else {
+-        REXAPU_WARN("XMA: Read from unknown register ({:04X})", r);
++        REXAPU_DEBUG("XMA: Read from unknown register ({:04X})", r);
+       }
+       break;
+   }
+@@ -292,6 +283,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+ 
+     // The context ID is a bit in the range of the entire context array.
+     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
++    uint32_t kicked_value = value;
+     for (int i = 0; value && i < 32; ++i, value >>= 1) {
+       if (value & 1) {
+         uint32_t context_id = base_context_id + i;
+@@ -301,6 +293,13 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+     }
+     // Signal the decoder thread to start processing.
+     work_event_->Set();
++    // Block until the worker finishes, so the game sees updated context data.
++    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
++      if (kicked_value & 1) {
++        uint32_t context_id = base_context_id + i;
++        contexts_[context_id].WaitForWorkDone();
++      }
++    }
+   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
+     // Context lock command.
+     // This requests a lock by flagging the context.
+@@ -311,6 +310,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+         uint32_t context_id = base_context_id + i;
+         auto& context = contexts_[context_id];
+         context.Disable();
++        // [XMA fix] Added Block(false) after Disable(). Without this, the game
++        // could call XMADisableContext and start modifying the context struct
++        // while a decode was still in progress on the worker thread. Block()
++        // waits for the context mutex to be free (poll=false means wait, not spin).
++        context.Block(false);
+       }
+     }
+     // Signal the decoder thread to start processing.
+@@ -333,10 +337,10 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+       default: {
+         const auto register_info = register_file_.GetRegisterInfo(r);
+         if (register_info) {
+-          REXAPU_WARN("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
+-                      register_info->name, value);
++          REXAPU_DEBUG("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
++                       register_info->name, value);
+         } else {
+-          REXAPU_WARN("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
++          REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+         }
+         break;
+       }
+@@ -351,6 +355,9 @@ void XmaDecoder::Pause() {
+   }
+   paused_ = true;
+ 
++  if (work_event_) {
++    work_event_->Set();
++  }
+   pause_fence_.Wait();
+ }
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index e45ba35..8d7c9ae 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -32,7 +33,15 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
+ 
+-REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++// Parche: desactivado por defecto. Con true, las esperas de la GPU duermen con el
++// temporizador impreciso de Windows y el juego cae a ~30 FPS; con false va a ~60.
++REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
++
++// Parche de CPU: en WAIT_REG_MEM (con vsync=false) girar con yield solo los primeros
++// 0,5 ms y despues dormir de a 1 ms. false = girar siempre (comportamiento anterior).
++// Desactivado por defecto: bajaba los FPS y desfasaba las notas (probado 28/10/2026).
++REXCVAR_DEFINE_BOOL(gpu_wait_sleep, false, "GPU",
++                    "Dormir en esperas largas de WAIT_REG_MEM en vez de girar");
+ 
+ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+                      "Fake sample count for occlusion queries")
+@@ -335,7 +344,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+   if (!regs.GetRegisterInfo(index)) {
+-    REXGPU_WARN("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
++    REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
+   // Scratch register writeback.
+@@ -947,6 +956,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           : register_file_->values[poll_reg_addr];
+ 
+   bool matched = false;
++  const auto wait_start = std::chrono::steady_clock::now();  // Parche: gpu_wait_sleep
+   do {
+     uint32_t value = value_ref;
+     if (is_memory) {
+@@ -990,7 +1000,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         PrepareForWait();
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+-          rex::thread::MaybeYield();
++          if (REXCVAR_GET(gpu_wait_sleep) &&
++              std::chrono::steady_clock::now() - wait_start > std::chrono::microseconds(500)) {
++            rex::thread::Sleep(std::chrono::milliseconds(1));
++          } else {
++            rex::thread::MaybeYield();
++          }
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 3345603..6193585 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -40,6 +40,11 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
+ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
+                     "Read render-to-texture results on the CPU");
+ 
++// Parche: con escala de resolucion, las escrituras de memexport quitan la marca de
++// "dibujada con escala" de la memoria escrita (texturas armadas por la GPU).
++REXCVAR_DEFINE_BOOL(memexport_unmark_scaled, true, "GPU/D3D12",
++                    "Con escala: memexport quita la marca de memoria dibujada con escala");
++
+ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends");
+ 
+@@ -2282,6 +2287,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+       shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+                                         memexport_range.size_bytes);
++      // Parche: con escala, quitar la marca de "dibujada con escala" de la zona escrita.
++      if (REXCVAR_GET(memexport_unmark_scaled) && texture_cache_->IsDrawResolutionScaled()) {
++        texture_cache_->UnmarkScaledResolveRangeWrittenByGpu(
++            memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
++      }
+     }
+     if (REXCVAR_GET(d3d12_readback_memexport)) {
+       // Read the exported data on the CPU.
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 5ac6cb6..4f4dd61 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -34,6 +34,11 @@ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
+ 
+ REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
+ 
++// Parche: interrupciones de vblank a ritmo fijo y exacto (la Xbox da 60 por segundo).
++// Antes: cada 1 ms con vsync=false (~1000/s) o cada ~16-17 ms con vsync=true, reiniciando
++// el reloj en cada una. 0 = comportamiento original.
++REXCVAR_DEFINE_INT32(vblank_hz, 60, "GPU", "Interrupciones de vblank por segundo (0 = original)");
++
+ namespace {
+ constexpr bool kStoreShaders = true;
+ }  // namespace
+@@ -104,6 +109,37 @@ X_STATUS GraphicsSystem::Setup(runtime::Processor* processor, system::KernelStat
+   vsync_worker_running_ = true;
+   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
+       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
++        if (const int32_t hz = REXCVAR_GET(vblank_hz); hz > 0) {
++          // Parche: vblanks parejos y sin perder ninguno (medido: llegaban ~58/s con
++          // intervalos de 3 a 30 ms). Prioridad alta, dormir hasta ~1,5 ms antes de la
++          // hora y girar el ultimo tramo; si hay atraso, recuperar los que faltan.
++          if (auto* self = rex::thread::Thread::GetCurrentThread()) {
++            self->set_priority(rex::thread::ThreadPriority::kHighest);
++          }
++          const uint64_t freq = chrono::Clock::guest_tick_frequency();
++          const uint64_t period = freq / hz;
++          const uint64_t spin_ticks = freq * 3 / 2000;  // 1,5 ms
++          uint64_t next = chrono::Clock::QueryGuestTickCount() + period;
++          while (vsync_worker_running_) {
++            const uint64_t now = chrono::Clock::QueryGuestTickCount();
++            if (now >= next) {
++              MarkVblank();
++              next += period;
++              if (now >= next + freq) {
++                next = now + period;  // mas de 1 s de atraso (depurador, etc.): no recuperar
++              }
++              continue;
++            }
++            const uint64_t remaining = next - now;
++            if (remaining > spin_ticks) {
++              rex::thread::Sleep(
++                  std::chrono::microseconds((remaining - spin_ticks) * 1000000 / freq));
++            } else {
++              rex::thread::MaybeYield();
++            }
++          }
++          return 0;
++        }
+         uint64_t vsync_duration = REXCVAR_GET(vsync) ? 16 : 1;
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+         while (vsync_worker_running_) {
+@@ -200,7 +236,7 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
+       return 0x050002D0;
+     default:
+       if (!register_file_.GetRegisterInfo(r)) {
+-        REXGPU_ERROR("GPU: Read from unknown register ({:04X})", r);
++        REXGPU_DEBUG("GPU: Read from unknown register ({:04X})", r);
+       }
+   }
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index f00c160..cbdbef2 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -45,6 +45,23 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
+                      "Soft texture cache memory limit lifetime (seconds)")
+     .range(1, 3600);
+ 
++// Parche: con escala, las texturas en formatos comprimidos (DXT1/3/5, DXN, ...) nunca usan
++// la version escalada: la GPU de la Xbox no puede dibujar en esos formatos, asi que son
++// texturas normales del juego que solo rozan paginas de una zona dibujada (false =
++// comportamiento original).
++REXCVAR_DEFINE_BOOL(scaled_resolve_skip_compressed, true, "GPU",
++                    "Con escala, las texturas comprimidas nunca se leen de la memoria escalada");
++
++// Parche: con escala, si la imagen principal de una textura fue dibujada con escala pero
++// sus mipmaps no, se crea sin mipmaps (en vez de leer mipmaps vacios).
++REXCVAR_DEFINE_BOOL(scaled_resolve_drop_unscaled_mips, true, "GPU",
++                    "Con escala, crear sin mipmaps las texturas cuyos mipmaps no estan escalados");
++
++// Parche: cuando la CPU escribe memoria, quitar la marca de "dibujada con escala" solo del
++// rango escrito (el original quitaba la de todo el bloque de 8 MB). false = original.
++REXCVAR_DEFINE_BOOL(scaled_resolve_unmark_exact, true, "GPU",
++                    "Con escala, las escrituras de la CPU solo quitan la marca de escala de su rango");
++
+ REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
+     .range(1, 8)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -577,7 +594,12 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   // Check if the texture is a scaled resolve texture.
+-  if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
++  // Parche: las texturas comprimidas (DXT1 de los instrumentos, ...) nunca son resultado de
++  // un dibujo de la GPU; si solo rozan una zona dibujada no deben leerse escaladas.
++  const bool skip_compressed = REXCVAR_GET(scaled_resolve_skip_compressed) &&
++                               FormatInfo::Get(key.format)->type == FormatType::kCompressed;
++  if (IsDrawResolutionScaled() && key.tiled && !skip_compressed &&
++      IsScaledResolveSupportedForFormat(key)) {
+     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
+          IsRangeScaledResolved(key.base_page << 12,
+@@ -586,6 +608,18 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+          IsRangeScaledResolved(key.mip_page << 12,
+                                scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+       key.scaled_resolve = 1;
++      // Parche: imagen principal dibujada con escala pero mipmaps NO (texturas armadas
++      // por la GPU, p. ej. los instrumentos): el SDK cargaba los mipmaps de la memoria
++      // escalada, donde no hay nada (negro/basura a distancia). Se crea sin mipmaps.
++      if (REXCVAR_GET(scaled_resolve_drop_unscaled_mips) && key.mip_page &&
++          scaled_resolve_guest_layout.base.level_data_extent_bytes &&
++          scaled_resolve_guest_layout.mips_total_extent_bytes && key.GetWidth() >= 32 &&
++          key.GetHeight() >= 32 &&
++          !IsRangeScaledResolved(key.mip_page << 12,
++                                 scaled_resolve_guest_layout.mips_total_extent_bytes)) {
++        key.mip_page = 0;
++        key.mip_max_level = 0;
++      }
+     }
+   }
+ 
+@@ -873,6 +907,21 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
+                                                   invalidated_by_gpu);
+ }
+ 
++bool TextureCache::UnmarkScaledResolveRangeWrittenByGpu(uint32_t start_unscaled,
++                                                        uint32_t length_unscaled) {
++  if (!IsDrawResolutionScaled() || !length_unscaled) {
++    return false;
++  }
++  auto global_lock = global_critical_region_.Acquire();
++  if (!IsRangeScaledResolved(start_unscaled, length_unscaled)) {
++    return false;
++  }
++  // Misma logica que para las escrituras del procesador.
++  ScaledResolveGlobalWatchCallback(global_lock, start_unscaled,
++                                   start_unscaled + length_unscaled - 1, false);
++  return true;
++}
++
+ void TextureCache::ScaledResolveGlobalWatchCallback(
+     const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
+     uint32_t address_last, bool invalidated_by_gpu) {
+@@ -889,8 +938,20 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+   uint32_t resolve_block_last = resolve_page_last >> 5;
+   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
+   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
++  bool unmark_exact = REXCVAR_GET(scaled_resolve_unmark_exact);
+   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
+     uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
++    // Parche: recorrer solo los bloques dentro del rango, como IsRangeScaledResolved. Sin
++    // esto se borraban las marcas de todo el bloque de 8 MB alrededor de cada escritura de
++    // la CPU (texturas de instrumentos de GH:WoR negras con escala).
++    if (unmark_exact) {
++      if (i == resolve_l2_block_first) {
++        resolve_l2_block &= ~((UINT64_C(1) << (resolve_block_first & 63)) - 1);
++      }
++      if (i == resolve_l2_block_last && (resolve_block_last & 63) != 63) {
++        resolve_l2_block &= (UINT64_C(1) << ((resolve_block_last & 63) + 1)) - 1;
++      }
++    }
+     uint32_t resolve_block_relative_index;
+     while (rex::bit_scan_forward(resolve_l2_block, &resolve_block_relative_index)) {
+       resolve_l2_block &= ~(UINT64_C(1) << resolve_block_relative_index);
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index 776c27a..9c51ec1 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -20,8 +20,40 @@
+ #include <rex/logging.h>
+ #include <rex/ui/virtual_key.h>
+ 
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <GameInput.h>  // Windows SDK (GameInput v0, GameInput.dll del sistema)
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++#endif
++
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+ 
++// Parche: forzar el subtipo del mando (0 = automatico, 7 = guitarra GH, 6 = guitarra RB)
++REXCVAR_DEFINE_UINT32(force_controller_subtype, 7, "Input",
++                      "Forzar subtipo XInput de los mandos (0 = automatico)");
++
++// Parche: la guitarra GH de 360 tiene un sensor de tilt tipo interruptor (manda el maximo
++// de golpe) y el juego espera casi 32767 en el eje derecho vertical. Guitarras con sensor
++// gradual (Riffmaster con traductor) tenian que levantar el mastil del todo. Si el tilt
++// pasa este umbral se manda el maximo. 0 = sin cambio.
++REXCVAR_DEFINE_INT32(tilt_threshold, 16000, "Input",
++                     "Umbral de tilt: desde este valor el eje derecho vertical se manda al maximo");
++
++// Parche: guitarras RB4 de Xbox One (PDP Riffmaster, PDP Jaguar, Mad Catz Stratocaster)
++// leidas directamente con GameInput, sin programa traductor (RB4InstrumentMapper).
++// Formato de los mensajes y conversion tomados de RB4InstrumentMapper
++// (XboxGuitarInput, XboxRiffmasterInput, GuitarViGEmMapper, RiffmasterViGEmMapper).
++REXCVAR_DEFINE_BOOL(native_rb4_guitar, true, "Input",
++                    "Leer guitarras RB4 de Xbox One con GameInput (sin programa traductor)");
++
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
+ 
+@@ -143,7 +175,9 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+   // Unfortunately drivers can't present all information immediately (e.g.
+   // battery information) so this needs to be refreshed every time.
+-  UpdateXCapabilities(*controller);
++  if (controller->sdl) {  // Parche: la guitarra RB4 nativa no tiene mando SDL
++    UpdateXCapabilities(*controller);
++  }
+ 
+   std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
+ 
+@@ -201,6 +235,9 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  if (!controller->sdl) {  // Parche: la guitarra RB4 nativa no vibra
++    return X_ERROR_SUCCESS;
++  }
+ #if SDL_VERSION_ATLEAST(2, 0, 9)
+   if (SDL_GameControllerRumble(controller->sdl, vibration->left_motor_speed,
+                                vibration->right_motor_speed, 0)) {
+@@ -495,6 +532,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
+       break;
+     case SDL_CONTROLLER_AXIS_RIGHTY:
+       pad.thumb_ry = ~event.caxis.value;
++      if (const int32_t thr = REXCVAR_GET(tilt_threshold); thr > 0 && pad.thumb_ry >= thr) {
++        pad.thumb_ry = 32767;  // Parche: tilt como el sensor de la guitarra original
++      }
+       break;
+     case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+       pad.left_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
+@@ -590,7 +630,294 @@ std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_Joyst
+   return std::nullopt;
+ }
+ 
++#ifdef _WIN32
++namespace {
++
++// Parche: lector de guitarras RB4 de Xbox One por GameInput.
++// Mensaje de entrada (id 0x20), little-endian:
++//   0-1 botones (formato mando Xbox One)  2 tilt  3 whammy  4 selector de efectos
++//   5 trastes superiores  6 trastes inferiores (solo)  7-9 sin uso
++//   Riffmaster ademas: 10-11 joystick X, 12-13 joystick Y, 14 botones de sistema.
++class NativeGuitarReader {
++ public:
++  // Si hay una guitarra conectada devuelve true y deja en *pad su estado.
++  bool Poll(X_INPUT_GAMEPAD* pad) {
++    Init();
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!input_ || !device_) {
++      return false;
++    }
++    IGameInputReading* reading = nullptr;
++    if (SUCCEEDED(input_->GetCurrentReading(GameInputKindRawDeviceReport, device_, &reading)) &&
++        reading) {
++      IGameInputRawDeviceReport* report = nullptr;
++      if (reading->GetRawReport(&report) && report) {
++        uint8_t data[64] = {};
++        const uint32_t id = report->GetReportInfo()->id;
++        const size_t size = report->GetRawData(sizeof(data), data);
++        if (id == 0x20 && size >= 10) {
++          Parse(data, size);
++        }
++        report->Release();
++      }
++      reading->Release();
++    }
++    *pad = pad_;
++    return true;
++  }
++
++ private:
++  static bool IsGuitar(uint16_t vid, uint16_t pid, bool* riffmaster) {
++    *riffmaster = vid == 0x0E6F && pid == 0x0248;               // PDP Riffmaster
++    return *riffmaster || (vid == 0x0E6F && pid == 0x0170) ||  // PDP Jaguar
++           (vid == 0x0738 && pid == 0x4161);                    // Mad Catz Stratocaster
++  }
++
++  static void CALLBACK OnDevice(GameInputCallbackToken, void* context, IGameInputDevice* device,
++                                uint64_t, GameInputDeviceStatus current_status,
++                                GameInputDeviceStatus) {
++    auto* self = static_cast<NativeGuitarReader*>(context);
++    const GameInputDeviceInfo* info = device->GetDeviceInfo();
++    bool riffmaster = false;
++    if (!info || !IsGuitar(info->vendorId, info->productId, &riffmaster)) {
++      return;
++    }
++    std::lock_guard<std::mutex> lock(self->mutex_);
++    if (current_status & GameInputDeviceConnected) {
++      if (!self->device_) {
++        device->AddRef();
++        self->device_ = device;
++        self->pad_ = {};
++        REXLOG_INFO("Guitarra RB4 nativa conectada (GameInput): {:04X}:{:04X}{}", info->vendorId,
++                    info->productId, riffmaster ? " (Riffmaster)" : "");
++      }
++    } else if (self->device_ == device) {
++      self->device_->Release();
++      self->device_ = nullptr;
++      REXLOG_INFO("Guitarra RB4 nativa desconectada");
++    }
++  }
++
++  void Init() {
++    if (initialized_) {
++      return;
++    }
++    initialized_ = true;
++    HMODULE lib = LoadLibraryW(L"GameInput.dll");
++    using GameInputCreateFn = HRESULT(WINAPI*)(IGameInput**);
++    auto create =
++        lib ? reinterpret_cast<GameInputCreateFn>(GetProcAddress(lib, "GameInputCreate")) : nullptr;
++    if (!create || FAILED(create(&input_)) || !input_) {
++      REXLOG_WARN("GameInput no disponible: sin soporte nativo para guitarras RB4");
++      input_ = nullptr;
++      return;
++    }
++    // La enumeracion bloqueante llama a OnDevice con las guitarras ya conectadas;
++    // las que se conecten despues llegan desde el hilo de GameInput.
++    if (FAILED(input_->RegisterDeviceCallback(nullptr, GameInputKindRawDeviceReport,
++                                              GameInputDeviceConnected,
++                                              GameInputBlockingEnumeration, this, OnDevice,
++                                              &token_))) {
++      REXLOG_WARN("GameInput: no se pudo registrar el aviso de dispositivos");
++    }
++  }
++
++  void Parse(const uint8_t* d, size_t size) {
++    const uint16_t b = uint16_t(d[0] | (d[1] << 8));
++    const uint8_t frets = d[5] | d[6];
++    const bool lower_frets = d[6] != 0;
++    uint16_t x = 0;
++    if (b & 0x0004) x |= X_INPUT_GAMEPAD_START;       // Menu
++    if (b & 0x0008) x |= X_INPUT_GAMEPAD_BACK;        // Options (Star Power)
++    if (b & 0x0100) x |= X_INPUT_GAMEPAD_DPAD_UP;     // rasgueo arriba
++    if (b & 0x0200) x |= X_INPUT_GAMEPAD_DPAD_DOWN;   // rasgueo abajo
++    if (b & 0x0400) x |= X_INPUT_GAMEPAD_DPAD_LEFT;
++    if (b & 0x0800) x |= X_INPUT_GAMEPAD_DPAD_RIGHT;
++    if (frets & 0x01) x |= X_INPUT_GAMEPAD_A;              // verde
++    if (frets & 0x02) x |= X_INPUT_GAMEPAD_B;              // rojo
++    if (frets & 0x04) x |= X_INPUT_GAMEPAD_Y;              // amarillo
++    if (frets & 0x08) x |= X_INPUT_GAMEPAD_X;              // azul
++    if (frets & 0x10) x |= X_INPUT_GAMEPAD_LEFT_SHOULDER;  // naranja
++    // Trastes inferiores (solo) o clic del joystick de la Riffmaster.
++    if (lower_frets || (b & 0x4000)) x |= X_INPUT_GAMEPAD_LEFT_THUMB;
++    pad_.buttons = x;
++
++    // Whammy: 0..255 -> -32768..32767. Tilt: 0..255 -> 0..32767 (+ umbral de tilt).
++    pad_.thumb_rx = int16_t((d[3] << 8 | d[3]) - 0x8000);
++    int32_t tilt = (d[2] << 8 | d[2]) >> 1;
++    if (const int32_t thr = REXCVAR_GET(tilt_threshold); thr > 0 && tilt >= thr) {
++      tilt = 32767;
++    }
++    pad_.thumb_ry = int16_t(tilt);
++
++    // Selector de efectos: 5 posiciones en el gatillo izquierdo (26, 77, 128, 179, 230).
++    const int pickup = std::min(d[4] >> 4, 4) + 1;
++    pad_.left_trigger = uint8_t(51 * pickup - 25);
++    pad_.right_trigger = 0;
++
++    if (size >= 14) {  // joystick de la Riffmaster
++      pad_.thumb_lx = int16_t(d[10] | (d[11] << 8));
++      pad_.thumb_ly = int16_t(d[12] | (d[13] << 8));
++    }
++  }
++
++  IGameInput* input_ = nullptr;
++  IGameInputDevice* device_ = nullptr;
++  GameInputCallbackToken token_ = 0;
++  bool initialized_ = false;
++  std::mutex mutex_;
++  X_INPUT_GAMEPAD pad_{};
++};
++
++NativeGuitarReader g_native_guitar;
++
++}  // namespace
++#endif
++
++#ifdef _WIN32
++// Parche re-wor: teclado como guitarra de Xbox 360 para el jugador 1. Se suma a la guitarra o
++// mando que haya (o funciona solo) y solo cuenta si la ventana del juego esta activa.
++// keyboard_map = codigos de tecla virtual de Windows separados por comas, en este orden:
++// verde, rojo, amarillo, azul, naranja, rasgueo arriba, rasgueo abajo, whammy, energia
++// estrella, start, izquierda, derecha.
++REXCVAR_DEFINE_BOOL(keyboard_guitar, true, "Input", "Usar el teclado como guitarra (jugador 1)");
++REXCVAR_DEFINE_STRING(keyboard_map, "49,50,51,52,53,38,40,17,16,13,37,39", "Input",
++                      "Teclas de la guitarra: verde,rojo,amarillo,azul,naranja,arriba,abajo,"
++                      "whammy,estrella,start,izquierda,derecha (codigos VK)");
++
++namespace {
++// Botones de X_INPUT_GAMEPAD para cada tecla de keyboard_map (el whammy va aparte).
++constexpr uint16_t kKeyboardButtons[] = {
++    0x1000 /* A: verde */,          0x2000 /* B: rojo */,      0x8000 /* Y: amarillo */,
++    0x4000 /* X: azul */,           0x0100 /* LB: naranja */,  0x0001 /* arriba */,
++    0x0002 /* abajo */,             0 /* whammy */,            0x0020 /* Back: estrella */,
++    0x0010 /* Start */,             0x0004 /* izquierda */,    0x0008 /* derecha */,
++};
++constexpr size_t kKeyboardWhammy = 7;
++constexpr size_t kKeyboardKeyCount = sizeof(kKeyboardButtons) / sizeof(kKeyboardButtons[0]);
++
++bool GameWindowFocused() {
++  DWORD process = 0;
++  GetWindowThreadProcessId(GetForegroundWindow(), &process);
++  return process == GetCurrentProcessId();
++}
++
++// Lee el teclado. Devuelve false si no hay ninguna tecla de la guitarra apretada.
++bool ReadKeyboardGuitar(uint16_t* buttons, bool* whammy) {
++  static std::string parsed_map;
++  static int keys[kKeyboardKeyCount] = {};
++  const std::string& map = REXCVAR_GET(keyboard_map);
++  if (map != parsed_map) {
++    parsed_map = map;
++    size_t start = 0;
++    for (size_t i = 0; i < kKeyboardKeyCount; ++i) {
++      size_t end = map.find(',', start);
++      keys[i] = std::atoi(map.substr(start, end - start).c_str());
++      start = end == std::string::npos ? map.size() : end + 1;
++    }
++  }
++  *buttons = 0;
++  *whammy = false;
++  if (!GameWindowFocused()) {
++    return false;
++  }
++  for (size_t i = 0; i < kKeyboardKeyCount; ++i) {
++    if (keys[i] > 0 && (GetAsyncKeyState(keys[i]) & 0x8000)) {
++      if (i == kKeyboardWhammy) {
++        *whammy = true;
++      } else {
++        *buttons |= kKeyboardButtons[i];
++      }
++    }
++  }
++  return *buttons || *whammy;
++}
++}  // namespace
++#endif
++
++#ifdef _WIN32
++// Parche re-wor: orden de los jugadores. Cada periferico es un jugador distinto y se asignan en
++// el orden de input_priority: "guitarra" (guitarras RB4 de Xbox One nativas), "teclado" y
++// "mandos" (mandos y guitarras de Xbox 360 por SDL, en su orden).
++REXCVAR_DEFINE_STRING(input_priority, "guitarra,teclado,mandos", "Input",
++                      "Orden de los jugadores: guitarra, teclado, mandos (separados por comas)");
++
++namespace {
++// Capacidades de guitarra de Xbox 360. El juego reconoce el instrumento por el subtipo y por
++// los demas campos (en cero tomaba el teclado como microfono).
++void FillGuitarCaps(X_INPUT_CAPABILITIES& c) {
++  c = {};
++  c.type = 0x01;
++  c.sub_type =
++      REXCVAR_GET(force_controller_subtype) ? REXCVAR_GET(force_controller_subtype) : 0x07;
++  c.flags = 0;
++  c.gamepad.buttons = 0xF3FF;
++  c.gamepad.left_trigger = 0xFF;
++  c.gamepad.right_trigger = 0xFF;
++  c.gamepad.thumb_lx = static_cast<int16_t>(0xFFFFu);
++  c.gamepad.thumb_ly = static_cast<int16_t>(0xFFFFu);
++  c.gamepad.thumb_rx = static_cast<int16_t>(0xFFFFu);
++  c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
++}
++}  // namespace
++#endif
++
+ SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(uint32_t user_index) {
++#ifdef _WIN32
++  using Device = ControllerState*;
++  Device devices[8];
++  size_t device_count = 0;
++  auto add = [&](Device device) {
++    if (device && device_count < 8) {
++      devices[device_count++] = device;
++    }
++  };
++  auto update = [](ControllerState& state, const X_INPUT_GAMEPAD& pad) {
++    if (std::memcmp(&state.state.gamepad, &pad, sizeof(pad)) != 0) {
++      state.state.gamepad = pad;
++      state.state_changed = true;
++    }
++  };
++
++  const std::string& priority = REXCVAR_GET(input_priority);
++  size_t start = 0;
++  while (start <= priority.size()) {
++    size_t end = priority.find(',', start);
++    std::string kind = priority.substr(start, end == std::string::npos ? std::string::npos
++                                                                       : end - start);
++    if (kind == "guitarra" && REXCVAR_GET(native_rb4_guitar)) {
++      static ControllerState native{};
++      X_INPUT_GAMEPAD pad{};
++      if (g_native_guitar.Poll(&pad)) {
++        FillGuitarCaps(native.caps);
++        update(native, pad);
++        add(&native);
++      }
++    } else if (kind == "teclado" && REXCVAR_GET(keyboard_guitar)) {
++      static ControllerState keyboard{};
++      uint16_t buttons;
++      bool whammy;
++      ReadKeyboardGuitar(&buttons, &whammy);
++      X_INPUT_GAMEPAD pad{};
++      pad.buttons = buttons;
++      pad.thumb_rx = whammy ? 32767 : -32768;  // whammy apretada / suelta
++      FillGuitarCaps(keyboard.caps);
++      update(keyboard, pad);
++      add(&keyboard);
++    } else if (kind == "mandos") {
++      for (auto& controller : controllers_) {
++        if (controller.sdl) {
++          add(&controller);
++        }
++      }
++    }
++    if (end == std::string::npos) {
++      break;
++    }
++    start = end + 1;
++  }
++  return user_index < device_count ? devices[user_index] : nullptr;
++#else
+   if (user_index >= controllers_.size()) {
+     return nullptr;
+   }
+@@ -599,8 +926,10 @@ SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(uint32_t use
+     return nullptr;
+   }
+   return controller;
++#endif
+ }
+ 
++
+ bool SDLInputDriver::TestSDLVersion() const {
+ #if SDL_VERSION_ATLEAST(2, 0, 9)
+   // SDL 2.0.9 or newer is required for simple rumble support and player
+@@ -623,6 +952,23 @@ bool SDLInputDriver::TestSDLVersion() const {
+   return true;
+ }
+ 
++#ifdef _WIN32
++// Parche: leer el subtipo real del mando (guitarra, bateria...) directo de XInput
++static uint8_t GetNativeXInputSubType(int user_index) {
++  using XInputGetCapsFn = uint32_t (*)(uint32_t, uint32_t, void*);
++  static XInputGetCapsFn fn = []() -> XInputGetCapsFn {
++    void* lib = SDL_LoadObject("xinput1_4.dll");
++    if (!lib) lib = SDL_LoadObject("xinput1_3.dll");
++    if (!lib) return nullptr;
++    return reinterpret_cast<XInputGetCapsFn>(SDL_LoadFunction(lib, "XInputGetCapabilities"));
++  }();
++  if (!fn || user_index < 0 || user_index > 3) return 0;
++  uint8_t caps[20] = {};
++  if (fn(static_cast<uint32_t>(user_index), 0, caps) != 0) return 0;
++  return caps[1];  // SubType
++}
++#endif
++
+ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+   assert(state.sdl);
+   uint16_t cap_flags = 0x0;
+@@ -657,6 +1003,16 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+   auto& c = state.caps;
+   c.type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
+   c.sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
++#ifdef _WIN32
++  if (uint8_t st = GetNativeXInputSubType(SDL_GameControllerGetPlayerIndex(state.sdl)); st != 0) {
++    c.sub_type = st;
++    REXLOG_INFO("Parche: subtipo XInput nativo {:#04x}", st);
++  }
++#endif
++  if (REXCVAR_GET(force_controller_subtype) != 0) {
++    c.sub_type = static_cast<uint8_t>(REXCVAR_GET(force_controller_subtype));
++    REXLOG_INFO("Parche: subtipo forzado a {:#04x}", c.sub_type);
++  }
+   c.flags = cap_flags;
+   c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
+   c.gamepad.left_trigger = 0xFF;
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index adfc3ce..366c463 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
++#include <rex/system/flags.h>
+ 
+ #if REX_PLATFORM_WIN32
+ #include <windows.h>
+@@ -189,19 +190,7 @@ ppc_u32_result_t XGetGameRegion_entry() {
+ }
+ 
+ ppc_u32_result_t XGetLanguage_entry() {
+-  auto desired_language = XLanguage::kEnglish;
+-
+-  // Switch the language based on game region.
+-  // TODO(benvanik): pull from xex header.
+-  uint32_t game_region = XEX_REGION_NTSCU;
+-  if (game_region & XEX_REGION_NTSCU) {
+-    desired_language = XLanguage::kEnglish;
+-  } else if (game_region & XEX_REGION_NTSCJ) {
+-    desired_language = XLanguage::kJapanese;
+-  }
+-  // Add more overrides?
+-
+-  return uint32_t(desired_language);
++  return REXCVAR_GET(user_language);
+ }
+ 
+ ppc_u32_result_t XamGetCurrentTitleId_entry() {
+diff --git a/src/kernel/xam/xam_notify.cpp b/src/kernel/xam/xam_notify.cpp
+index 4137ea5..ab857d2 100644
+--- a/src/kernel/xam/xam_notify.cpp
++++ b/src/kernel/xam/xam_notify.cpp
+@@ -65,6 +65,20 @@ ppc_u32_result_t XNotifyGetNext_entry(ppc_u32_t handle, ppc_u32_t match_id, ppc_
+   *id_ptr = 0;
+ 
+   // Grab listener.
++  // Parche re-wor: comprobar el tipo del objeto. LookupObject<T> solo lo comprueba con un
++  // assert (desactivado en release); con DLC grandes el juego a veces pasaba un handle de
++  // otro objeto y DequeueNotification lo leia como lista de avisos y crasheaba.
++  auto object = kernel_state()->object_table()->LookupObject<XObject>(handle);
++  if (!object || object->type() != XNotifyListener::kObjectType) {
++    if (object) {
++      static uint32_t s_logged = 0;
++      if (s_logged++ < 10) {
++        REXKRNL_WARN("XNotifyGetNext: el handle {:08X} no es una lista de avisos (tipo {})",
++                     uint32_t(handle), uint32_t(object->type()));
++      }
++    }
++    return 0;
++  }
+   auto listener = kernel_state()->object_table()->LookupObject<XNotifyListener>(handle);
+   if (!listener) {
+     return 0;
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 37f9ae9..d4e1688 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -28,7 +28,7 @@
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
+ 
+-REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
++REXCVAR_DEFINE_UINT32(user_language, 5, "Kernel", "User's language ID");
+ 
+ namespace rex {
+ namespace kernel {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+index 05ae5f3..a4c9463 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+@@ -54,7 +54,17 @@ ppc_u32_result_t XAudioEnableDucker_entry(ppc_u32_t unk) {
+ 
+ ppc_u32_result_t XAudioRegisterRenderDriverClient_entry(ppc_pu32_t callback_ptr,
+                                                         ppc_pu32_t driver_ptr) {
++  REXKRNL_DEBUG("XAudioRegisterRenderDriverClient called! callback_ptr={:08X} driver_ptr={:08X}",
++                callback_ptr.guest_address(), driver_ptr.guest_address());
++  if (!callback_ptr) {
++    return X_E_INVALIDARG;
++  }
++
+   uint32_t callback = callback_ptr[0];
++
++  if (!callback) {
++    return X_E_INVALIDARG;
++  }
+   uint32_t callback_arg = callback_ptr[1];
+ 
+   auto* audio_system = static_cast<audio::AudioSystem*>(kernel_state()->emulator()->audio_system());
+@@ -82,6 +92,13 @@ ppc_u32_result_t XAudioSubmitRenderDriverFrame_entry(ppc_pvoid_t driver_ptr,
+                                                      ppc_pvoid_t samples_ptr) {
+   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
+ 
++  static uint32_t submit_krnl_count = 0;
++  if (submit_krnl_count < 10) {
++    REXKRNL_DEBUG("XAudioSubmitRenderDriverFrame: driver={:08X} samples={:08X}",
++                  driver_ptr.guest_address(), samples_ptr.guest_address());
++    submit_krnl_count++;
++  }
++
+   auto* audio_system = static_cast<audio::AudioSystem*>(kernel_state()->emulator()->audio_system());
+   audio_system->SubmitFrame(driver_ptr.guest_address() & 0x0000FFFF, samples_ptr.guest_address());
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+index 4eb1adb..b2f43f6 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+@@ -64,6 +64,7 @@ using rex::audio::XMA_CONTEXT_DATA;
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.xaudio2.xaudio2_buffer(v=vs.85).aspx
+ 
+ ppc_u32_result_t XMACreateContext_entry(ppc_pu32_t context_out_ptr) {
++  REXKRNL_DEBUG("XMACreateContext called!");
+   auto xma_decoder =
+       static_cast<audio::AudioSystem*>(kernel_state()->emulator()->audio_system())->xma_decoder();
+   uint32_t context_ptr = xma_decoder->AllocateContext();
+@@ -341,6 +342,9 @@ ppc_u32_result_t XMABlockWhileInUse_entry(ppc_pvoid_t context_ptr) {
+     if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
+       break;
+     }
++    if (!context.work_buffer_ptr) {
++      break;
++    }
+     rex::thread::Sleep(std::chrono::milliseconds(1));
+   } while (true);
+   return 0;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 4be8285..1e0eb69 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -12,6 +12,17 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++#include <rex/cvar.h>
++
++// Parche: en la Xbox el juego va a 60 FPS exactos (vsync de la tele). Sin vsync aqui iba a
++// 62-64 FPS y el carril de notas se adelantaba a la musica (~4%). Este limite se aplica en
++// VdSwap con espera precisa (dormir + girar los ultimos ms). 0 = sin limite.
++REXCVAR_DEFINE_INT32(guest_fps_limit, 60, "GPU", "Limite de FPS del juego (0 = sin limite)");
++
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/xenos.h>
+@@ -37,6 +48,10 @@ constexpr double kDisplayGammaPower = 2.22222233;
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++// Parche: FPS reales del juego para el contador de F3 (los lee rex_app.cpp con extern).
++std::atomic<double> g_guest_fps{0.0};
++std::atomic<uint64_t> g_guest_frames{0};
++
+ // https://web.archive.org/web/20150805074003/https://www.tweakoz.com/orkid/
+ // http://www.tweakoz.com/orkid/dox/d3/d52/xb360init_8cpp_source.html
+ // https://github.com/Free60Project/xenosfb/
+@@ -342,6 +357,52 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
+   assert(width);
+   assert(height);
+ 
++  // Parche: limitar a guest_fps_limit cuadros por segundo con un ritmo fijo.
++  if (const int32_t limit = REXCVAR_GET(guest_fps_limit); limit > 0) {
++    using clock = std::chrono::steady_clock;
++    static clock::time_point s_next{};
++    const auto period = std::chrono::duration_cast<clock::duration>(
++        std::chrono::duration<double>(1.0 / limit));
++    auto now = clock::now();
++    if (s_next == clock::time_point{} || now > s_next + period * 4) {
++      s_next = now;  // primer cuadro, o el juego se atraso mucho: no intentar recuperar
++    } else if (now < s_next) {
++      const auto margin = std::chrono::milliseconds(2);
++      if (s_next - now > margin) {
++        std::this_thread::sleep_for(s_next - now - margin);
++      }
++      while (clock::now() < s_next) {
++        std::this_thread::yield();
++      }
++    }
++    s_next += period;
++  }
++
++  // Parche: contar los cuadros reales del juego (cada VdSwap = el juego entrega un cuadro)
++  {
++    static uint32_t s_frames = 0;
++    static auto s_last = std::chrono::steady_clock::now();
++    ++s_frames;
++    ++g_guest_frames;
++    const auto now = std::chrono::steady_clock::now();
++    const double elapsed = std::chrono::duration<double>(now - s_last).count();
++    if (elapsed >= 2.0) {
++      REXGPU_INFO("Parche: Guest FPS = {:.1f}", s_frames / elapsed);
++      s_frames = 0;
++      s_last = now;
++    }
++    // Para el contador de F3 (rex_app.cpp): se actualiza cada medio segundo.
++    static uint32_t s_overlay_frames = 0;
++    static auto s_overlay_last = now;
++    ++s_overlay_frames;
++    const double overlay_elapsed = std::chrono::duration<double>(now - s_overlay_last).count();
++    if (overlay_elapsed >= 0.5) {
++      g_guest_fps = s_overlay_frames / overlay_elapsed;
++      s_overlay_frames = 0;
++      s_overlay_last = now;
++    }
++  }
++
+   namespace xenos = rex::graphics::xenos;
+ 
+   xenos::xe_gpu_texture_fetch_t gpu_fetch;
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index 6b080c0..d558faa 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -9,18 +9,31 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <mutex>
+ #include <string>
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
++#include "../../filesystem/devices/stfs_container_device.h"
++#include <rex/logging.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/content_manager.h>
+ #include <rex/system/xfile.h>
+ #include <rex/system/xobject.h>
+ 
++// Parche re-wor: carpeta con paquetes de DLC sin extraer (archivos STFS de la Xbox).
++REXCVAR_DEFINE_STRING(dlc_path, "GH_DLC", "Content",
++                      "Carpeta con paquetes de DLC sin extraer (STFS), tambien en subcarpetas; "
++                      "ruta relativa = junto al exe");
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+@@ -31,6 +44,99 @@ static const char* kGameUserContentDirName = "profile";
+ 
+ static int content_device_id_ = 0;
+ 
++// Parche re-wor: paquetes STFS ("LIVE", "PIRS" o "CON ") encontrados en dlc_path, por nombre
++// de archivo. Se guardan aqui y no en ContentManager para no tocar content_manager.h, que lo
++// incluye el codigo del juego (cambiarlo recompila todo).
++namespace {
++struct StfsPackageInfo {
++  std::filesystem::path path;
++  uint32_t content_type;
++  uint32_t title_id;
++  std::u16string display_name;
++};
++std::mutex stfs_packages_mutex;
++std::map<std::string, StfsPackageInfo> stfs_packages;
++bool stfs_packages_scanned = false;
++
++std::filesystem::path GetDlcFolder() {
++  std::filesystem::path path = rex::to_path(REXCVAR_GET(dlc_path));
++  if (!path.empty() && path.is_relative()) {
++    path = rex::filesystem::GetExecutableFolder() / path;
++  }
++  return path;
++}
++
++// Cabecera STFS: tipo de contenido en 0x344, juego en 0x360 y nombre (UTF-16 big endian,
++// primer idioma) en 0x411.
++bool ReadStfsHeader(const std::filesystem::path& path, StfsPackageInfo& info) {
++  uint8_t header[0x491];
++  FILE* file = rex::filesystem::OpenFile(path, "rb");
++  if (!file) {
++    return false;
++  }
++  size_t read = std::fread(header, 1, sizeof(header), file);
++  std::fclose(file);
++  if (read != sizeof(header) ||
++      (std::memcmp(header, "LIVE", 4) && std::memcmp(header, "PIRS", 4) &&
++       std::memcmp(header, "CON ", 4))) {
++    return false;
++  }
++  auto load_be32 = [&header](size_t offset) {
++    return (uint32_t(header[offset]) << 24) | (uint32_t(header[offset + 1]) << 16) |
++           (uint32_t(header[offset + 2]) << 8) | uint32_t(header[offset + 3]);
++  };
++  info.path = path;
++  info.content_type = load_be32(0x344);
++  info.title_id = load_be32(0x360);
++  info.display_name.clear();
++  for (size_t offset = 0x411; offset + 1 < sizeof(header); offset += 2) {
++    char16_t c = char16_t((header[offset] << 8) | header[offset + 1]);
++    if (!c) {
++      break;
++    }
++    info.display_name.push_back(c);
++  }
++  return true;
++}
++
++void ScanStfsPackages() {
++  std::map<std::string, StfsPackageInfo> found;
++  std::filesystem::path folder = GetDlcFolder();
++  std::error_code ec;
++  if (!folder.empty() && std::filesystem::is_directory(folder, ec)) {
++    for (auto it = std::filesystem::recursive_directory_iterator(
++             folder, std::filesystem::directory_options::skip_permission_denied, ec);
++         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
++      if (!it->is_regular_file(ec) || it->file_size(ec) < 0x1000) {
++        continue;
++      }
++      StfsPackageInfo info;
++      if (!ReadStfsHeader(it->path(), info)) {
++        continue;
++      }
++      // El nombre va en XCONTENT_DATA::file_name_raw (42 caracteres). Los DLC oficiales ya
++      // cumplen; a los nombres largos, con caracteres raros o repetidos (DLC de la comunidad)
++      // se les da uno corto y fijo a partir de la ruta (FNV-1a).
++      std::string name = rex::path_to_utf8(it->path().filename());
++      bool name_fits = !name.empty() && name.size() <= 42 &&
++                       std::all_of(name.begin(), name.end(),
++                                   [](char c) { return c > 0x20 && c < 0x7F; });
++      if (!name_fits || found.count(name)) {
++        uint64_t hash = 0xCBF29CE484222325ull;
++        for (char c : rex::path_to_utf8(it->path())) {
++          hash = (hash ^ uint8_t(c)) * 0x100000001B3ull;
++        }
++        name = fmt::format("cdlc_{:016X}", hash);
++      }
++      found.emplace(name, std::move(info));
++    }
++  }
++  std::lock_guard<std::mutex> lock(stfs_packages_mutex);
++  stfs_packages = std::move(found);
++  stfs_packages_scanned = true;
++}
++}  // namespace
++
+ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                                const XCONTENT_AGGREGATE_DATA& data,
+                                const std::filesystem::path& package_path)
+@@ -39,9 +145,17 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
+   content_data_ = data;
+ 
+   auto fs = kernel_state_->file_system();
+-  auto device =
+-      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
+-  device->Initialize();
++  std::unique_ptr<rex::filesystem::Device> device;
++  std::error_code ec;
++  if (std::filesystem::is_regular_file(package_path, ec)) {
++    // Parche re-wor: paquete STFS sin extraer (DLC de dlc_path).
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
++  } else {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
++  }
++  if (!device->Initialize()) {
++    REXSYS_WARN("ContentPackage: no se pudo abrir {}", rex::path_to_utf8(package_path));
++  }
+   fs->RegisterDevice(std::move(device));
+   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+ }
+@@ -71,6 +185,24 @@ std::filesystem::path ContentManager::ResolvePackageRoot(XContentType content_ty
+ }
+ 
+ std::filesystem::path ContentManager::ResolvePackagePath(const XCONTENT_AGGREGATE_DATA& data) {
++  // Parche re-wor: paquete STFS de la carpeta de DLC (dlc_path).
++  if (data.content_type == XContentType::kMarketplaceContent) {
++    if (!stfs_packages_scanned) {
++      ScanStfsPackages();
++    }
++    uint32_t title_id = data.title_id;
++    if (title_id == kCurrentlyRunningTitleId) {
++      title_id = kernel_state_->title_id();
++    }
++    std::lock_guard<std::mutex> lock(stfs_packages_mutex);
++    auto it = stfs_packages.find(data.file_name());
++    if (it != stfs_packages.end() &&
++        it->second.content_type == uint32_t(XContentType::kMarketplaceContent) &&
++        it->second.title_id == title_id) {
++      return it->second.path;
++    }
++  }
++
+   // Content path:
+   // content_root/title_id/content_type/data_file_name/
+   auto package_root = ResolvePackageRoot(data.content_type, data.title_id);
+@@ -104,6 +236,29 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     result.emplace_back(std::move(content_data));
+   }
+ 
++  // Parche re-wor: tambien los paquetes STFS sin extraer de la carpeta de DLC (dlc_path).
++  if (content_type == XContentType::kMarketplaceContent) {
++    ScanStfsPackages();
++    std::lock_guard<std::mutex> lock(stfs_packages_mutex);
++    for (const auto& [name, info] : stfs_packages) {
++      if (info.content_type != uint32_t(content_type) || info.title_id != title_id ||
++          std::any_of(result.begin(), result.end(),
++                      [&name](const XCONTENT_AGGREGATE_DATA& d) { return d.file_name() == name; })) {
++        continue;
++      }
++      XCONTENT_AGGREGATE_DATA content_data;
++      content_data.device_id = device_id;
++      content_data.content_type = content_type;
++      content_data.set_display_name(info.display_name.empty() ? rex::path_to_utf16(name)
++                                                              : info.display_name);
++      content_data.set_file_name(name);
++      content_data.title_id = title_id;
++      result.emplace_back(std::move(content_data));
++      REXSYS_INFO("DLC encontrado: {} ({})", rex::path_to_utf8(info.path.filename()),
++                  rex::string::to_utf8(info.display_name));
++    }
++  }
++
+   return result;
+ }
+ 
+diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
+index 3c9d5ab..e9de979 100644
+--- a/src/system/xam/user_profile.cpp
++++ b/src/system/xam/user_profile.cpp
+@@ -16,6 +16,11 @@
+ #include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
++#include <rex/cvar.h>
++
++// Parche re-wor: nombre del usuario (gamertag) configurable, por ejemplo desde el launcher.
++REXCVAR_DEFINE_STRING(user_name, "User", "Kernel",
++                      "Nombre del usuario (gamertag) que ve el juego, maximo 15 caracteres");
+ 
+ namespace rex {
+ namespace system {
+@@ -26,7 +31,10 @@ UserProfile::UserProfile() {
+   // if non-zero, it prevents the user from playing the game.
+   // "You do not have permissions to perform this operation."
+   xuid_ = 0xB13EBABEBABEBABE;
+-  name_ = "User";
++  name_ = REXCVAR_GET(user_name).substr(0, 15);
++  if (name_.empty()) {
++    name_ = "User";
++  }
+ 
+   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
+   // https://github.com/arkem/py360/blob/master/py360/constants.py
+diff --git a/src/ui/overlay/debug_overlay.cpp b/src/ui/overlay/debug_overlay.cpp
+index e9b1e8f..939ed55 100644
+--- a/src/ui/overlay/debug_overlay.cpp
++++ b/src/ui/overlay/debug_overlay.cpp
+@@ -29,16 +29,18 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
+     return;
+ 
+   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+-  ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSize(ImVec2(250, 70), ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.5f);
+   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+-    ImGui::Text("Host:  %.1f FPS (%.2f ms)", io.Framerate, 1000.0f / io.Framerate);
++    // Parche: primero los FPS reales del juego; "Display" es cuantas veces se redibuja la
++    // ventana (con --vblank_hz=120 marca 120 aunque el juego vaya a 60).
+     if (stats_provider_) {
+       auto stats = stats_provider_();
+       if (stats.frame_count > 0) {
+-        ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
++        ImGui::Text("Game:    %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+       }
+     }
++    ImGui::Text("Display: %.1f FPS", io.Framerate);
+   }
+   ImGui::End();
+ }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 5c1d2d1..2b47ddc 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -35,8 +35,15 @@
+ 
+ #include <imgui.h>
+ 
++#include <atomic>
+ #include <filesystem>
+ 
++// Parche: FPS reales del juego, definidos en xboxkrnl_video.cpp (VdSwap).
++namespace rex::kernel::xboxkrnl {
++extern std::atomic<double> g_guest_fps;
++extern std::atomic<uint64_t> g_guest_frames;
++}  // namespace rex::kernel::xboxkrnl
++
+ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ 
+@@ -172,7 +179,14 @@ bool ReXApp::OnInitialize() {
+         imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
+         imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, immediate_drawer_.get());
+         // Built-in overlays
+-        debug_overlay_ = std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get());
++        // Parche: el contador de F3 tambien muestra los FPS reales del juego (VdSwap).
++        debug_overlay_ = std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), [] {
++          ui::FrameStats stats;
++          stats.fps = rex::kernel::xboxkrnl::g_guest_fps.load();
++          stats.frame_time_ms = stats.fps > 0 ? 1000.0 / stats.fps : 0;
++          stats.frame_count = rex::kernel::xboxkrnl::g_guest_frames.load();
++          return stats;
++        });
+         console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+         settings_overlay_ = std::make_unique<ui::SettingsDialog>(
+             imgui_drawer_.get(), exe_dir / (std::string(GetName()) + ".toml"));

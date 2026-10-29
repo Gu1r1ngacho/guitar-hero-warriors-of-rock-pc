@@ -101,3 +101,8 @@ add_custom_target(re_wor_codegen
     COMMENT "Generating recompiled code for re_wor"
     VERBATIM
 )
+
+# Launcher de re-wor (parche propio; "rexglue migrate" lo borraria).
+if(WIN32)
+    add_subdirectory(launcher)
+endif()

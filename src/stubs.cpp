@@ -64,6 +64,11 @@ PPC_STUB_TRACKED(__imp__IoCompleteRequest);
 PPC_STUB_TRACKED(__imp__IoDeleteDevice);
 PPC_STUB_TRACKED(__imp__IoDismountVolume);
 PPC_STUB_TRACKED(__imp__IoInvalidDeviceRequest);
+// Parche: el SDK hace las lecturas de forma sincrona, asi que nunca hay nada pendiente
+// que cancelar. Como en la Xbox/Windows reales, NtCancelIoFile devuelve exito
+// (STATUS_SUCCESS). Antes devolvia 0xC0000225 y la funcion del juego que detiene un
+// stream de musica (sub_8256BA88) marcaba el stream como error (estado 5).
+PPC_STUB_RETURN(__imp__NtCancelIoFile, 0);  // STATUS_SUCCESS
 
 // --- Kernel Object Manager ---
 PPC_STUB_TRACKED(__imp__ObReferenceObject);
