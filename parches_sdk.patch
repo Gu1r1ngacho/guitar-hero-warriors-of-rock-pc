@@ -3091,3 +3091,18 @@ index 5c1d2d1..2b47ddc 100644
          console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
          settings_overlay_ = std::make_unique<ui::SettingsDialog>(
              imgui_drawer_.get(), exe_dir / (std::string(GetName()) + ".toml"));
+diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
+index 33092ba..bdc3cd4 100644
+--- a/src/ui/windowed_app_main_win.cpp
++++ b/src/ui/windowed_app_main_win.cpp
+@@ -22,7 +22,9 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_win.h>
+ 
+-REXCVAR_DEFINE_BOOL(enable_console, true, "UI/Window", "Enable console window on Windows");
++// Parche: desactivada por defecto (los jugadores no necesitan la ventana de consola; el log
++// queda en el archivo). Para depurar: --enable_console=true.
++REXCVAR_DEFINE_BOOL(enable_console, false, "UI/Window", "Enable console window on Windows");
+ 
+ namespace {
+ 
